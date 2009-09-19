@@ -9,6 +9,7 @@
 #include <linux/proc_fs.h>      /* Necessary because we use proc fs */
 #include <linux/sched.h>        /* For putting processes to sleep and waking them up */
 #include <linux/interrupt.h>
+#include <linux/device.h>
 #include <asm/bitops.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
@@ -20,42 +21,38 @@
 1. Все платы сидят на одном прерывании (один обработчик прерывания)
 возможные IRQ - 5,7,10,11,12
 2. Все платы работают на одной частоте 1800/3600 Гц
-3. Данные из фреймов переписываются в буфер пользователя как есть, при потере кадра указатель в буфере пользователя
-сдвигается на число пропущенных байт данных фрейма
-4. Параметры: маска используемых каналов - , irq , pov_mask(по умолчанию включены ПОВ1 и ПОВ2), частота
-	дискретизации - sample_rate (по умолчанию 1800)
-5. Соответствующие каналам названия устройств в драйвере: ПОВ1/1 - pov0, ПОВ1/2 - pov1, ПОВ2/1 - pov3, 		ПОВ2/2 - pov4 и т.д.
+3. Данные из фреймов переписываются в буфер пользователя как есть
+4. Параметры: номер перывания - irq (по умолчанию 7), 
+маска используемых каналов - pov_mask(по умолчанию 15, ПОВ1 и ПОВ2), 
+частота	дискретизации - sample_rate (по умолчанию 1800)
+5. Соответствующие каналам названия устройств в драйвере: 
+ПОВ1/1 - /dev/pov0, ПОВ1/2 - /dev/pov1,..., ПОВ4/2 - /dev/pov7
 */
 
 #define MAX_BOARDS	4
 #define MAX_CHANNELS (MAX_BOARDS*2)
 
 #define FIFO_SIZE 0x2000
-#define BUF_SIZE FIFO_SIZE*2
 
+#define FRAME_COUNTER_MASK 0x3f
+#define MAX_FRAME_COUNTER 0x40
+#define POV_FRAME_SIZE 35
+#define FRAME_DATA_SIZE 32
+#define MSB_MASK 0x7f
+#define FRAME_CLOSE_BYTE 0x73
+#define READ_COUNTER_TIMEOUT 10
+#define AD_OVERFLOW  0x4000
+#define COUNTER_MASK  0x1FFF
+//Флаг первого отсчета данных
+#define START_COUNT_FLAG 1
 
-#define FRAME_COUNTER_MASK			0x3f
-#define MAX_FRAME_COUNTER			0x40
-#define FRAME_SIZE							35
-#define FRAME_DATA_SIZE				32
-#define MSB_MASK							0x7f
-#define FRAME_CLOSE_BYTE				0x73
-#define READ_COUNTER_TIMEOUT 		10
-//FIXME Таймаут должен соответствовать размеру буферов
-#define READ_TIMEOUT						HZ
-#define  AD_OVERFLOW       0x8000
-#define COUNTER_MASK   0x1FFF
-
-
-DECLARE_WAIT_QUEUE_HEAD(pov_queue);
-
-static void pov_do_tasklet( unsigned long unused );
-DECLARE_TASKLET(pov_tasklet, pov_do_tasklet, 0);
-
-
+static void pov_do_work(struct work_struct *w);
+struct workqueue_struct *work_queue;
+static struct work_struct work;
+spinlock_t irq_lock = SPIN_LOCK_UNLOCKED;
 
 #define DEFAULT_IRQ 7	//или 12 (PS/2 мышь)
-int irq = DEFAULT_IRQ;
+static int irq = DEFAULT_IRQ;
 module_param(irq, int, S_IRUGO);
 
 //Маска задействованных каналов
@@ -69,9 +66,7 @@ module_param(irq, int, S_IRUGO);
 #define POV42 0x80
 #define POV_MASK	(POV11|POV12|POV21|POV22|POV31|POV32|POV41|POV42)
 
-
-
-int pov_mask = (POV11|POV12|POV21|POV22);
+static int pov_mask = (POV11|POV12|POV21|POV22);
 module_param(pov_mask, int, S_IRUGO);
 
 //частота переменного тока
@@ -83,406 +78,341 @@ module_param(pov_mask, int, S_IRUGO);
 int sample_rate = BASE_SAMPLE_RATE;
 module_param(sample_rate, int, S_IRUGO);
 
-int exit;							//Exit module flag
 long long irq_counter;
-long long tasklet_counter;
+long long work_counter;
 
-enum dev_state{	//Переходы:
-	state_unused,	//=init_module=>state_closed
- 	state_closed,		//=pov_open=>state_opened
- 	state_error,		//=pov_release=>state_closed
- 	state_opened		//=hard_error=>state_error  или =pov_release=>state_closed
+enum dev_states {	//Переходы:
+	STATE_UNUSED,	//=init_module=>STATE_CLOSED
+ 	STATE_CLOSED,	//=pov_open=>STATE_OPENED
+ 	STATE_ERROR,	//=pov_release=>STATE_CLOSED
+ 	STATE_OPENED	//=hard_error=>STATE_ERROR  или =pov_release=>STATE_CLOSED
 };
-enum dev_error{ err_overflow, err_start_frame, err_timeout };
-enum parse_state{ parse_initial, parse_head, parse_msb, parse_lsb, parse_tail };
+enum parse_states {
+    PARSE_INITIAL, 
+    PARSE_HEAD, 
+    PARSE_MSB, 
+    PARSE_LSB, 
+    PARSE_TAIL
+};
 
-struct pov_dev
-{
-	enum dev_state state;
-	enum dev_error error;
-	enum parse_state pstate;
+struct sample {
+    struct timespec timestamp;
+    unsigned char data[FRAME_DATA_SIZE];
+};
+
+struct pov_dev {
+	enum dev_states state;
+	int error;
+	enum parse_states parse_state;
 
 	//Порты
 	int fifo8_port;
-	int fifo16_port;
 	int count_port;
 	int state_port;
 
-	int count_in_period;      				// Число отсчетов в периоде для канала
+	int cur_fifo_counter;					//Текущее значение счетчика  fifo
+	int last_fifo_counter;					//Предыдущее значение счетчика fifo
 
-	int last_fifo_counter;					//Предыдущее значение счетчика  fifo (-1 изначально)
-	int last_frame;							//Номер последнего разобранного фрейма (из заголовка фрейма)
 	int cur_frame;							//Номер разбираемого фрейма
-	int idx;										//Текущий lsb-байт фрейма
-	int last_byte;								//последний прочитанный байт
-	int skipped_bytes;						//Пропущено байт из-за сбойных фреймов ( в буфер пользователя будет записан пустой кусок такой длины )
+	int last_frame;							//Номер последнего разобранного фрейма (из заголовка фрейма)
+	int idx;								//Текущий lsb-байт фрейма
 
-	long long	bytes_read;
-	//struct semaphore sem;
+	long long bytes_read;
+	struct mutex mut;
+    struct completion compl;
 	struct cdev cdev;
 
-	//FIXME сделать динмический буфер, размер по умолчанию или параметр модуля
-	char buffer[ BUF_SIZE ];
-	char *buf_head;
-	char *buf_tail;
-
+	unsigned char *buf;
+	int buf_size;
 
 	//статистика
-	int buffer_overflows;				//число переполнений буфера
-	int fifo_overflows;					//число переполнений FIFO
-	int skipped_frames;				//пропусков кадров
-	int err_start_frame_count;
-	int err_sckiped_bytes;
+	int err_fifo_overflows;				//число переполнений FIFO
+	int err_skipped_frames;				//пропусков кадров
 };
 
 struct pov_dev channels[ MAX_CHANNELS ] = {
 	//ПОВ1
 	[0].fifo8_port = 0x150,
-	[0].fifo16_port = 0x152,
  	[0].count_port = 0x154,
   	[0].state_port = 0x158,
 
 	[1].fifo8_port = 0x151,
- 	[1].fifo16_port = 0x152,
   	[1].count_port = 0x156,
   	[1].state_port = 0x158,
 
    //ПОВ2
    	[2].fifo8_port = 0x15a,
-	[2].fifo16_port = 0x15c,
   	[2].count_port = 0x15e,
   	[2].state_port = 0x162,
 
 	[3].fifo8_port = 0x15b,
- 	[3].fifo16_port = 0x15c,
 	[3].count_port = 0x160,
 	[3].state_port = 0x162,
 
  	//ПОВ3
   	[4].fifo8_port = 0x180,
- 	[4].fifo16_port = 0x182,
 	[4].count_port = 0x184,
 	[4].state_port = 0x188,
 
   	[5].fifo8_port = 0x181,
- 	[5].fifo16_port = 0x182,
-	[4].count_port = 0x186,
-	[4].state_port = 0x188,
+	[5].count_port = 0x186,
+	[5].state_port = 0x188,
 
   	//ПОВ4
     [6].fifo8_port = 0x18a,
- 	[6].fifo16_port = 0x18c,
   	[6].count_port = 0x18e,
   	[6].state_port = 0x192,
 
 	[7].fifo8_port = 0x18b,
- 	[7].fifo16_port = 0x18c,
   	[7].count_port = 0x190,
   	[7].state_port = 0x192,
 };
 
 int pov_major, pov_minor;
 dev_t dev;
+static struct class *pov_class;
+struct timespec timestamp;
+//Период между отсчетами
+s64 count_duration_ns;
+//Период между аналогами внутри отсчета 
+s64 analog_duration_ns;
 
-static void dev_parse_data( struct pov_dev *dev, char *buf, int *size )
+static void dev_start(struct pov_dev *dev)
 {
-	char byte;
-	char  last_byte = dev->last_byte;
-	int idx = dev->idx;
-	enum parse_state state = dev->pstate;
-	int skipped_bytes = dev->skipped_bytes;
-	int skipped_frames;
-
-
-	while( dev->buf_tail != dev->buf_head && *size )
-	{
-		byte = *dev->buf_tail;
-		retry:
-		switch( state )
-		{
-			case parse_initial:
-			{
-				if( (byte & 0xC0) == 0x80 )
-				{
-					state = parse_head;
-					dev->cur_frame = byte & FRAME_COUNTER_MASK;
-					if( dev->last_frame == -1 )
-						dev->last_frame = dev->cur_frame;
-				}
-				else if( dev->last_frame >= 0 )
-					dev->err_sckiped_bytes++;
-				break;
-			}
-			case parse_head:
-			{
-				if(  (byte & 0xCF) == 0x80 )
-				{
-					//Вычисляем число пропущенных байт и пропускаем столько же байт  в буфере пользователя
-					//FIXME Заполнить пропуск данными прошлого отсчета
-					skipped_frames = dev->cur_frame - dev->last_frame;
-					if( skipped_frames < 0 )
-						skipped_frames += MAX_FRAME_COUNTER;
-					if( --skipped_frames > 0 )
-						skipped_bytes += skipped_frames*FRAME_DATA_SIZE;
-					//Если размер буфера пользователя не кратен FRAME_DATA_SIZE
-					//то могут быть остатки из пропущенных байт от предыдущего чтения
-					if( skipped_bytes )
-					{
-						*size -= skipped_bytes;
-						if( *size <= 0  )
-						{
-							skipped_bytes = -*size;
-							*size = 0;
-							continue;		//Выходим
-						}
-						else
-							skipped_bytes = 0;
-
-					}
-					idx = 0;
-					state = parse_msb;
-				}
-				break;
-			}
-			case parse_msb:
-			{
-				if( byte & ~MSB_MASK )
-				{
-					state = parse_initial;
-					goto retry;
-				}
-				put_user( byte, buf++ );
-				dev->bytes_read++;
-				state = parse_lsb;
-				break;
-			}
-			case parse_lsb:
-			{
-				put_user( byte, buf++ );
-				dev->bytes_read++;
-				if( ++idx == 16 )
-				{
-					dev->last_frame = dev->cur_frame;
-					state = parse_tail;
-				}
-				else
-					state = parse_msb;
-
-				break;
-			}
-			case parse_tail:
-			{
-				if( byte !=  FRAME_CLOSE_BYTE )
-				{
-					state = parse_initial;
-					goto retry;
-				}
-				break;
-			}
-		}
-		(*size)--;
-		last_byte = byte;
-		dev->buf_tail++;
-		if( dev->buf_tail - dev->buffer >= BUF_SIZE )
-			dev->buf_tail = dev->buffer;
-	}
-	dev->last_byte = byte;
-	dev->idx = idx;
-	dev->pstate = state;
-	dev->skipped_bytes = skipped_bytes;
-}
-
-static unsigned short dev_read_counter( struct pov_dev *dev )
-{
-	unsigned short count = 0;
-	int i;
-	for( i=0; i<READ_COUNTER_TIMEOUT; i++ )
-	{
-		count = inw(dev->count_port);
-		if( count == inw(dev->count_port) )
-			break;
-	}
-	return count;
-}
-
-static void dev_start( struct pov_dev *dev )
-{
-	unsigned char state = inb( dev->state_port );
+    unsigned short count;
+	unsigned char state = inb(dev->state_port);
+    count = inw(dev->count_port);
+    printk(KERN_DEBUG "pov: start cur state:%x count:%x\n", state, count);
 	//порт фифо А четный, а В - нечетный
-	state |=  (dev->fifo8_port%2+1);
-	outb( state, dev->state_port );
+	state |= (dev->fifo8_port%2+1);
+	outb(state, dev->state_port);
+    count = inw(dev->count_port);
+    printk(KERN_DEBUG "pov: start set state:%x count:%x\n", state, count);
+    outb(0, dev->fifo8_port);
 }
 
-static void dev_stop( struct pov_dev *dev )
+static void dev_stop(struct pov_dev *dev)
 {
-	unsigned char state = inb( dev->state_port );
+    unsigned short count;
+	unsigned char state = inb(dev->state_port);
+    count = inw(dev->count_port);
+    printk(KERN_DEBUG "pov: stop cur state:%x count:%x\n", state, count);
 	//порт фифо А четный, а В - нечетный
 	state &= ~(dev->fifo8_port%2+1);
-	outb( state, dev->state_port );
+	outb(state, dev->state_port);
+    count = inw(dev->count_port);
+    printk(KERN_DEBUG "pov: stop set state:%x count:%x\n", state, count);
+    printk(KERN_DEBUG "pov: irq_counter:%lld work_counter:%lld\n", 
+        irq_counter, work_counter);
 }
 
-static void dev_hard_error( struct pov_dev *dev, enum dev_error err )
+static void dev_hard_error(struct pov_dev *dev, int err)
 {
-	if( dev->state == state_opened )
-	{
-		dev->state = state_error;
+	if (dev->state == STATE_OPENED) {
+		dev->state = STATE_ERROR;
 		dev->error = err;
-		dev_stop(  dev );
+		dev_stop(dev);
 	}
 }
 
-static int  dev_calc_data_count( struct pov_dev *dev, int count  )
+static int  dev_calc_data_count(struct pov_dev *dev, int count)
 {
 	int res;
-	if( dev->last_fifo_counter == -1 )
-		dev->last_fifo_counter = count;
 	res = count - dev->last_fifo_counter;
-	if(  res < 0 )
+	if (res < 0)
 		res += FIFO_SIZE;
+    dev->last_fifo_counter = count;
 	return res;
 }
 
 static int dev_open( struct pov_dev *dev )
 {
-	if( dev->state == state_unused )
+	if (dev->state == STATE_UNUSED)
 		return -ENODEV;
 
-	if( dev->state != state_closed )
+	if (dev->state != STATE_CLOSED)
 		return -EPERM;
 
-	dev->bytes_read = 0;
-	dev->buf_head = dev->buf_tail = dev->buffer;
-	dev->last_fifo_counter = -1;
-	dev->pstate = parse_initial;
+	dev->error = 0;
+
+    dev->bytes_read = 0;
+	dev->cur_fifo_counter = 0;
+	dev->last_fifo_counter = 0;
+	dev->parse_state = PARSE_INITIAL;
 	dev->last_frame = -1;
-	dev->skipped_bytes = 0;
+    
+    mutex_init(&dev->mut);
+    dev->buf = 0;
+    dev->buf_size = 0;
 
-	dev->buffer_overflows = 0;
-	dev->fifo_overflows = 0;
-	dev->skipped_frames = 0;
-	dev->err_start_frame_count = 0;
-	dev->err_sckiped_bytes = 0;
+	dev->err_fifo_overflows = 0;
+	dev->err_skipped_frames = 0;
 
-
-	dev->state = state_opened;
-	dev_start( dev );
-	return 0;          /* success */
+	dev->state = STATE_OPENED;
+	dev_start(dev);
+	return 0;
 }
 
-static int dev_release( struct pov_dev *dev )
+static int dev_release(struct pov_dev *dev)
 {
-	if( dev->state == state_unused )
+	if (dev->state == STATE_UNUSED)
 		return -ENODEV;
 
-	if( dev->state == state_opened )
-	{
-		tasklet_disable( &pov_tasklet );
-		dev_stop( dev );
-		dev->state = state_closed;
-		tasklet_enable( &pov_tasklet );
-	}
-	else
-		dev->state = state_closed;
-
-	return 0;          /* success */
-}
-
-static int dev_get_time_by_offset( struct pov_dev *dev,  long long offset, struct timespec *ts_ptr )
-{
-	struct timespec ts;
-	long long cur_offset;
-	int counter;
-	int data_count;
-	int buf_count;
-	int bytes_buffered;
-	long diff;
-	unsigned long flags;
-	long sec, rem;
-	s64 ns;
-
-	local_irq_save( flags );
-	getnstimeofday( &ts );
-	counter = dev_read_counter( dev );
-	buf_count = dev->buf_head - dev->buf_tail;
-	cur_offset = dev->bytes_read;
-	local_irq_restore( flags );
-
-	if( counter & AD_OVERFLOW )
-		return -EIO;
-
-	counter &= COUNTER_MASK;
-	data_count = dev_calc_data_count( dev, counter );
-	if( buf_count < 0 )
-		buf_count += BUF_SIZE;
-
-	bytes_buffered = data_count+ buf_count;
-	cur_offset += bytes_buffered/FRAME_SIZE*FRAME_DATA_SIZE +
-			(bytes_buffered%FRAME_DATA_SIZE > 2?  (bytes_buffered%FRAME_DATA_SIZE -2): 0 );
-
-	diff = cur_offset - offset;
-	if( diff < 0 )
-		return -EINVAL;
-
-	//приведение к функции timespec_add_ns
-	sec = diff/sample_rate;
-	rem = diff%sample_rate;
-	if( rem )
-	{
-		sec++;
-		ns = rem*NSEC_PER_SEC;
-		do_div( ns, sample_rate );
-		ns = NSEC_PER_SEC - ns;
-		timespec_add_ns( &ts, ns);
-	}
-	ts.tv_sec -= sec;
-
-	*ts_ptr = ts;
+	if (dev->state != STATE_CLOSED)	{
+		if (dev->state == STATE_OPENED)
+            dev_stop(dev);
+        mutex_destroy(&dev->mut);
+		dev->state = STATE_CLOSED;
+    }
 
 	return 0;
 }
 
-static int dev_get_offset_by_time( struct pov_dev *dev,  long long *offset, struct timespec time )
+
+static void adjust_timestamp(struct timespec *ts, int bytes_initially, 
+    int bytes_rest)
 {
-	struct timespec ts;
-	long long cur_offset;
-	int counter;
-	int data_count;
-	int buf_count;
-	int bytes_buffered;
-	s64 diff;
-
-	local_irq_disable();
-	getnstimeofday( &ts );
-	counter = dev_read_counter( dev );
-	buf_count = dev->buf_head - dev->buf_tail;
-	cur_offset = dev->bytes_read;
-	local_irq_enable();
-
-	if( counter & AD_OVERFLOW )
-		return -EIO;
-
-	counter &= COUNTER_MASK;
-	data_count = dev_calc_data_count( dev, counter );
-	if( buf_count < 0 )
-		buf_count += BUF_SIZE;
-
-	bytes_buffered = data_count+ buf_count;
-	cur_offset += bytes_buffered/FRAME_SIZE*FRAME_DATA_SIZE +
-			(bytes_buffered%FRAME_DATA_SIZE > 2?  (bytes_buffered%FRAME_DATA_SIZE -2): 0);
-
-	if( timespec_compare( &ts, &time ) < 0 )
-		return -EINVAL;
-
-	diff = (timespec_to_ns( &ts ) - timespec_to_ns(  &time ))*sample_rate;
-	do_div( diff, NSEC_PER_SEC );
-
-	*offset = cur_offset - diff;
-
-	return 0;
-
+    s64 ns1, ns2;
+    ns1 = count_duration_ns*bytes_initially;
+    ns1 = do_div(ns1, POV_FRAME_SIZE);
+    //FIXME Число аналогов не должно быть больше 16, 
+    //а bytes_initially - bytes_rest > 35
+    ns2 = analog_duration_ns*(bytes_initially - bytes_rest);
+    ns2 = do_div(ns2, 16);
+    timespec_add_ns(ts, -(ns1+ns2));
 }
 
+static void shift_timestamp(struct timespec *ts)
+{
+    timespec_add_ns(ts, count_duration_ns);
+}
 
+static void dev_read(struct pov_dev *dev)
+{
+    struct timespec ts, *pts;
+    int fifo_counter;
+    int bytes_initially, bytes_rest;
+    
+    //Сохранить время и счетчик
+    spin_lock_irq(&irq_lock);
+    ts = timestamp;
+    fifo_counter = dev->cur_fifo_counter;
+    spin_unlock_irq(&irq_lock);
+
+    mutex_lock(&dev->mut);
+    if (dev->state == STATE_OPENED && dev->buf_size) {
+        unsigned char byte;
+        int timestamp_adjusted = 0;
+        int skipped_frames;
+ 
+        if (fifo_counter & AD_OVERFLOW) {
+            dev->err_fifo_overflows++;
+            printk(KERN_DEBUG "pov: overflow:%x\n", fifo_counter);
+            goto err_exit;
+        }
+        
+        fifo_counter &= COUNTER_MASK;
+        bytes_rest = bytes_initially = dev_calc_data_count(dev, fifo_counter);
+
+        while (bytes_rest && dev->buf_size) {
+            byte = inb(dev->fifo8_port);
+            dev->bytes_read++;
+            bytes_rest--; 
+retry:
+            switch (dev->parse_state) {
+                case PARSE_INITIAL:	{
+                    if ((byte & 0xC0) == 0x80) {
+                        dev->parse_state = PARSE_HEAD;
+                        dev->cur_frame = byte & FRAME_COUNTER_MASK;
+                    }
+                    break;
+                }
+                case PARSE_HEAD: {
+                    if ((byte & 0xCF) == 0x80) {
+                        if (!timestamp_adjusted) { 
+                            adjust_timestamp(&ts, bytes_initially, bytes_rest);
+                            timestamp_adjusted = 1;
+                            ts.tv_nsec |= START_COUNT_FLAG;
+                        } else {
+                            shift_timestamp(&ts);
+                            ts.tv_nsec &= ~START_COUNT_FLAG;
+                        }
+
+                        if (dev->last_frame == -1)
+                            dev->last_frame = dev->cur_frame - 1;
+                        skipped_frames = dev->cur_frame - dev->last_frame;
+                        if (skipped_frames < 0)
+                            skipped_frames += MAX_FRAME_COUNTER;
+                        if (--skipped_frames > 0) {
+                            dev->err_skipped_frames++;
+                            printk(KERN_DEBUG "pov:skipped_frames:%d\n", 
+                                skipped_frames);
+                            goto err_exit;
+                        }        
+                        pts = (struct timespec *)dev->buf;
+                        put_user(ts, pts);
+                        dev->buf += sizeof(struct timespec);
+                        dev->buf_size -= sizeof(struct timespec);
+                        dev->idx = 0;
+                        dev->parse_state = PARSE_MSB;
+                    } else if (dev->last_frame == -1) {
+                        dev->parse_state = PARSE_INITIAL;
+                        goto retry;
+                    } else {                               
+                        printk(KERN_DEBUG "pov:not head2 byte:%d\n", byte);
+                        goto err_exit;
+                    }
+                    break;
+                }
+                case PARSE_MSB: {
+                    if (byte & ~MSB_MASK) {
+                        printk(KERN_DEBUG "pov:not MSB byte:%d\n", byte);
+                        goto err_exit;
+                    }
+                    put_user(byte, dev->buf);
+                    dev->buf++;
+                    dev->buf_size--;
+                    dev->parse_state = PARSE_LSB;
+                    break;
+                }
+                case PARSE_LSB: {
+                    put_user(byte, dev->buf);
+                    dev->buf++;
+                    dev->buf_size--;
+                    if (++(dev->idx) == 16) {
+                        dev->last_frame = dev->cur_frame;
+                        dev->parse_state = PARSE_TAIL;
+                    }
+                    else
+                        dev->parse_state = PARSE_MSB;
+                    break;
+                }
+                case PARSE_TAIL: {
+                    if (byte != FRAME_CLOSE_BYTE) {
+                        printk(KERN_DEBUG "pov:not frame close byte:%d\n", byte);
+                        goto err_exit;
+                    }
+                    dev->parse_state = PARSE_INITIAL;
+                    break;
+                }
+            }
+        }
+        if (!dev->buf_size)
+            complete(&dev->compl);
+    }       
+    mutex_unlock(&dev->mut);
+    return;
+
+err_exit:
+    //FIXME Не выходить с ошибкой, а выйти
+    //из функции, чтобы после обновления метки времени
+    //начать новый блок данных, не забыв сдвинуться назад 
+    //в буфере клиента
+    dev_hard_error(dev, -EIO);
+    complete(&dev->compl);
+    mutex_unlock(&dev->mut);
+}
+ 
 static int pov_open(struct inode *inode, struct file *filp)
 {
 	struct pov_dev *dev; /* device information */
@@ -504,151 +434,79 @@ static int pov_release(struct inode *inode, struct file *filp)
 	return dev_release( dev );
 }
 
-irqreturn_t pov_irq_handler( int irq, void *dev_id )
+irqreturn_t pov_irq_handler(int irq, void *dev_id)
 {
-	irq_counter++;
+    int i = 0;
+    irq_counter++;
+    
+    //Считать текущее время
+    getnstimeofday(&timestamp); 
 
-	tasklet_schedule( &pov_tasklet );
+    //Считать счетчики
+	for (; i < MAX_CHANNELS; i++) {
+		struct pov_dev * dev = &channels[i];
+		if (dev->state != STATE_UNUSED) {
+  			//Заодно сбросить прерывания
+			inb(dev->state_port);
+		    dev->cur_fifo_counter = inw(dev->count_port);
+        }
+    }
 
+	queue_work(work_queue, &work);
 	return IRQ_HANDLED;
 }
 
-static void pov_do_tasklet( unsigned long unused )
+static void pov_do_work(struct work_struct *w)
 {
-	int i = 0, j;
-	int counter, data_count, diff, buf_free;
-	//FIXME Читать из фифо не в промежуточный буфер а прямо в пользовательский буфер
+    int i = 0;
 
-	//Проверка счетчиков и чтение
-	for(; i < MAX_CHANNELS; i++ )
-	{
-		struct pov_dev * dev = &channels[ i ];
-		if( dev->state == state_opened )
-		{
-			inb( dev->state_port ); 			//Сбросить прерывания
-
-			counter = dev_read_counter( dev );
-			if( counter & AD_OVERFLOW )
-			{
-				dev_hard_error( dev, err_overflow );
-				continue;
-			}
-			counter &= COUNTER_MASK;
-			data_count = dev_calc_data_count( dev, counter );
-
-			//Сколько свободного места в буфере
-			buf_free = dev->buf_tail - dev->buf_head - 1;
-			if( buf_free < 0 )
-				buf_free += BUF_SIZE;
-			//Если места в буфере меньше чем данных в фифо,
-			//уменьшаем число считываемых байт из фифо и
-			// сохраненное значение счетчика фифо на их разницу
-			diff = data_count - buf_free;
-			if( diff > 0 )
-			{
-				data_count =buf_free;
-				counter -= diff;
-				if( counter < 0 )
-					counter += FIFO_SIZE;
-			}
-			dev->last_fifo_counter = counter;
-
-			//Читаем из фифо в буфер
-			//FIXME Проверить, возможно ли строковое чтение из порта функцией insb()
-			for(  j = 0; j < data_count; j++ )
-			{
-				*dev->buf_head++ = inb( dev->fifo8_port );
-				if( (dev->buf_head - dev->buffer) >= BUF_SIZE )
-					dev->buf_head = dev->buffer;
-			}
-		}
-	}
-
-	wake_up_interruptible(&pov_queue); /* awake any reading process */
+    work_counter++;
+    for (; i < MAX_CHANNELS; i++) {
+		struct pov_dev *dev = &channels[i];
+		if (dev->state != STATE_UNUSED)
+            dev_read(dev);
+    }
 }
 
 static ssize_t pov_read( struct file *filp, char *buf, size_t count, loff_t *f_pos )
 {
 	struct pov_dev *dev = filp->private_data;
-	struct timespec ts = { 0, 0 };
 	int ret = 0;
-	size_t to_read = count;
+    int timeout_in_jiffies = (count+FIFO_SIZE)*HZ/(sizeof(struct sample)*sample_rate);
+    
+    if (dev->state != STATE_OPENED)
+        return -ENODEV;
 
-	while( to_read )
-	{
-		if ( wait_event_interruptible_timeout( pov_queue, (dev->buf_head != dev->buf_tail) || exit, READ_TIMEOUT))
-			return -ERESTARTSYS; /* signal: tell the fs layer to handle it */
+    count *= sizeof(struct sample)/sizeof(struct sample);
+    if (!count)
+        return -EINVAL;
 
-		if( exit )
-			return -ENODEV;
+    mutex_lock(&dev->mut);
+    dev->buf = buf;
+    dev->buf_size = count;
+    init_completion(&dev->compl);
+    mutex_unlock(&dev->mut);
+    
+    ret = wait_for_completion_interruptible_timeout(&dev->compl, timeout_in_jiffies);
+    
+    mutex_lock(&dev->mut);
+    if (ret < 0)
+        dev_hard_error(dev, ret);
+    else if (ret == 0 && dev->buf_size)
+        dev_hard_error(dev, -ETIMEDOUT);
 
-		//Таймаут?
-		if( dev->buf_head == dev->buf_tail  )
-		{
-			//FIXME запрет обработки прерывания может вызвать переполнение fifo в работоспособных каналах
-			//Синхронизация с do_pov_tasklet
-			tasklet_disable( &pov_tasklet );
-			if( dev->state == state_opened )
-				dev_hard_error( dev, err_timeout );
-			tasklet_enable( &pov_tasklet );
-			return -EIO;
-		}
+    if (dev->state != STATE_OPENED)
+        return dev->error;
+    else
+        ret = count - dev->buf_size;
+    mutex_unlock(&dev->mut);
 
-		if(  !ts.tv_sec )
-		{
-			if( (ret = dev_get_time_by_offset( dev, dev->bytes_read, &ts )) < 0 )
-				return ret;
-			put_user( &ts, buf );
-			buf += sizeof( ts );
-			to_read -= sizeof( ts );
-		}
-		dev_parse_data( dev,  buf, &to_read  );
-
-	}
-
-	return count - to_read;
+    return ret;
 }
-
-
-static int pov_ioctl (struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg)
-{
-	long long offset;
-	int ret = -EINVAL;
-	struct pov_dev *dev; /* device information */
-	struct timespec ts;
-
-	dev = container_of(inode->i_cdev, struct pov_dev, cdev);
-	filp->private_data = dev; /* for other methods */
-	switch( cmd )
-	{
-		case POV_IOCXTIMEBYOFFSET:
-		{
-			ret = copy_from_user( &offset, (void *)arg, sizeof( long long ) );
-			if( ret == 0 )
-				ret = dev_get_time_by_offset( dev,  offset, &ts );
-			if( ret == 0)
-				ret = copy_to_user( (void *)arg, &ts, sizeof( ts ) );
-			break;
-		}
-		case POV_IOCXOFFSETBYTIME:
-		{
-			ret = copy_from_user( &ts, (void *)arg, sizeof( ts ) );
-			if( ret == 0 )
-				ret = dev_get_offset_by_time( dev,  &offset, ts );
-			if( ret == 0)
-				ret = copy_to_user( (void *)arg, &offset, sizeof( long long ) );
-			break;
-		}
-
-	}
-	return ret;
-}
-
+                          
 struct file_operations pov_fops = {
 	.owner =    THIS_MODULE,
- 	//.llseek =   pov_llseek,
  	.read =     pov_read,
-	.ioctl =    pov_ioctl,
  	.open =     pov_open,
  	.release =  pov_release
 };
@@ -658,100 +516,124 @@ static int pov_setup_cdev(struct pov_dev *dev, int index)
 	int err = 0, devno = MKDEV(pov_major, pov_minor + index);
 
 	cdev_init(&dev->cdev, &pov_fops);
+    device_create(pov_class,  0, devno, 0, "pov%d", index);
 	dev->cdev.owner = THIS_MODULE;
 	dev->cdev.ops = &pov_fops;
-	err = cdev_add (&dev->cdev, devno, 1);
+	err = cdev_add(&dev->cdev, devno, 1);
 
 	/* Fail gracefully if need be */
 	if (err)
 		printk(KERN_WARNING "pov: error %d adding pov%d\n", err, index);
 	else
 		printk(KERN_INFO "pov: added pov%d (%d %d)\n", index, pov_major, pov_minor + index);
-	return err;
+    return err;
 }
 
 static int __init pov_init_module(void)
 {
-	int err = 0, i;
+	int err = -ENODEV, i;
 	int quotient, remainder;
 	//проверка параметров
-	if( irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12 )
-	{
+	if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
 		printk(KERN_WARNING "pov: unsupported irq number %d\n", irq);
 		err = -EINVAL;
-		goto end;
+		goto out_param;
 	}
 
-	quotient = sample_rate/BASE_SAMPLE_RATE, remainder = sample_rate%BASE_SAMPLE_RATE;
-	if( quotient < 1 || quotient > MAX_SAMPLE_RATE_FACTOR || remainder )
-	{
+	quotient = sample_rate/BASE_SAMPLE_RATE; 
+    remainder = sample_rate%BASE_SAMPLE_RATE;
+	if (quotient < 1 || quotient > MAX_SAMPLE_RATE_FACTOR || remainder)	{
 		printk(KERN_WARNING "pov: invalid value for parameter 'sample_rate' %d\n", sample_rate);
 		err = -EINVAL;
-		goto end;
+		goto out_param;
 	}
-	if( !pov_mask || (pov_mask & POV_MASK) != pov_mask )
-	{
+	if (!pov_mask || (pov_mask & POV_MASK) != pov_mask)	{
 		printk(KERN_WARNING "pov: invalid value for parameter 'pov_mask' %d\n", pov_mask);
 		err = -EINVAL;
-		goto end;
+		goto out_param;
 	}
 
 	err = alloc_chrdev_region(&dev, pov_minor, MAX_CHANNELS,  "pov");
 	pov_major = MAJOR(dev);
-	if ( err < 0 )
-	{
+	if (err < 0) {
 		printk(KERN_WARNING "pov: can't get major %d\n", pov_major);
-		goto end;
+		goto out_region;
 	}
-
-	//Запросить прерывание в совместное пользование, в качестве уникального идентификатора - pov_major
-	err = request_irq( irq, pov_irq_handler, SA_SHIRQ, "pov", &pov_major );
-	if( err )
-	{
-		printk(KERN_WARNING "pov: installing an interrupt handler for irq %d failed\n", irq);
-		goto end;
+    pov_class = class_create(THIS_MODULE, "pov");
+	if (IS_ERR(pov_class)) {
+		err = PTR_ERR(pov_class);
+		goto out_class;
 	}
 
 
-	for(i=0; i < MAX_CHANNELS; i++)
-		if( pov_mask&(0x1<<i) )
-		{
+	for (i=0; i < MAX_CHANNELS; i++)
+		if (pov_mask & BIT(i)) {
+			channels[i].state = STATE_CLOSED;
 			err = pov_setup_cdev( &channels[i], i );
-			if( err )
-			{
+			if (err) {
 				printk(KERN_WARNING "pov: device pov%d setup error\n",  i);
-				cdev_del( &channels[ i ].cdev );
-				unregister_chrdev_region(dev, MAX_CHANNELS);
-				free_irq(  irq, &pov_major );
-				break;
+				goto out_dev;
 			}
-			channels[i].state = state_closed;
 		}
+ 
+    work_queue = create_singlethread_workqueue("pov_wq");
+ 	if (!work_queue) {
+		printk(KERN_WARNING "pov: create_singlethread_workqueue failed\n");
+		goto out_dev;
+    }
 
+    //Запросить прерывание в совместное пользование, 
+    //в качестве уникального идентификатора - pov_major
+	err = request_irq( irq, pov_irq_handler, IRQF_SHARED, "pov", &pov_major );
+	if (err) {
+		printk(KERN_WARNING "pov: installing an interrupt handler for irq %d failed\n", irq);
+		goto out_queue;
+    }
 
-	if( !err )
-		printk(KERN_INFO "pov: init sample_rate=%d pov_mask=%d\n", sample_rate, pov_mask);
+    spin_lock_init(&irq_lock);
+    count_duration_ns = 1000000000/sample_rate;
+    analog_duration_ns = count_duration_ns/16;
+    
+    INIT_WORK(&work, pov_do_work);
 
-end:
+    printk(KERN_INFO "pov: init sample_rate=%d irq=%d  pov_mask=%d\n", sample_rate, irq, pov_mask);
+
+    return 0;
+out_queue:
+    destroy_workqueue(work_queue);
+out_dev: 
+	class_destroy(pov_class);
+ 	for (i=0; i < MAX_CHANNELS; i++)
+		if (channels[i].state != STATE_UNUSED) { 
+            device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
+            cdev_del( &channels[ i ].cdev );    
+        }
+out_class:
+	unregister_chrdev_region(dev, MAX_CHANNELS);
+out_region:
+out_param:
 	return err;
 }
-
-
 
 static void __exit pov_exit_module(void)
 {
 	int i;
-	exit = 1;
-	for( i = 0; i < MAX_CHANNELS; i++ )
-		if( channels[ i ].state != state_opened )
-			dev_release( &channels[ i ] );
+    for (i = 0; i < MAX_CHANNELS; i++)
+        dev_release(&channels[i]);
 
-	free_irq(  irq, &pov_major );
-	tasklet_kill( &pov_tasklet );
-	for( i = 0; i < MAX_CHANNELS; i++ )
-		if( channels[ i ].state != state_unused )
+	free_irq(irq, &pov_major);
+
+    cancel_work_sync(&work);
+    flush_workqueue(work_queue);
+    destroy_workqueue(work_queue);
+
+	for (i = 0; i < MAX_CHANNELS; i++)
+		if (channels[ i ].state != STATE_UNUSED) {
+            device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
 			cdev_del( &channels[ i ].cdev );
-	unregister_chrdev_region(dev, MAX_CHANNELS);
+        }
+	class_destroy(pov_class);
+    unregister_chrdev_region(dev, MAX_CHANNELS);
 	printk( KERN_DEBUG "Module pov exit\n" );
 }
 
@@ -759,5 +641,6 @@ module_init(pov_init_module);
 module_exit(pov_exit_module);
 
 MODULE_DESCRIPTION("POV driver");
-MODULE_AUTHOR("Igor Bykov (igrbkv@rambler.ru)");
+MODULE_AUTHOR("Igor Bykov (igor@parma.spb.ru)");
 MODULE_LICENSE("GPL");
+
