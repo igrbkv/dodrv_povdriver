@@ -44,7 +44,7 @@
 #define AD_OVERFLOW  0x4000
 #define COUNTER_MASK  0x1FFF
 //Флаг первого отсчета данных
-#define START_COUNT_FLAG 1
+#define FIRST_SAMPLE_FLAG 1
 
 static void pov_do_work(struct work_struct *w);
 struct workqueue_struct *work_queue;
@@ -101,6 +101,7 @@ struct sample {
 };
 
 struct pov_dev {
+    int index;  //dev/pov<index>
 	enum dev_states state;
 	int error;
 	enum parse_states parse_state;
@@ -110,33 +111,44 @@ struct pov_dev {
 	int count_port;
 	int state_port;
 
-	int cur_fifo_counter;					//Текущее значение счетчика  fifo
-	int last_fifo_counter;					//Предыдущее значение счетчика fifo
+	int cur_fifo_counter;  	    //Текущее значение счетчика  fifo
+	int last_fifo_counter; 	    //Предыдущее значение счетчика fifo
 
-	int cur_frame;							//Номер разбираемого фрейма
-	int last_frame;							//Номер последнего разобранного фрейма (из заголовка фрейма)
-	int idx;								//Текущий lsb-байт фрейма
+	int cur_frame_num;	   	    //Номер разбираемого фрейма
+	int last_frame_num;	   	    //Номер последнего разобранного 
+                                //фрейма (из заголовка фрейма)
+	int data_byte_idx;	        //Текущий байт фрейма
+    int first_sample_flag;      //Флаг начала данных
+    struct sample cur_sample;
 
-	long long bytes_read;
-	struct mutex mut;
     struct completion compl;
 	struct cdev cdev;
 
-	unsigned char *buf;
-	int buf_size;
-
-	//статистика
-	int err_fifo_overflows;				//число переполнений FIFO
-	int err_skipped_frames;				//пропусков кадров
+    int bytes_in_fifo;
+    //ПУ калибратор
+    int pu_freq_period_ns;
+    struct timespec begin_time;
+    struct timespec end_time;
+    long long bytes_from_pu;
+    
+    //статистика
+    long long read_counter;
+	long long bytes_read;
+	int err_fifo_overflow;      //ошибок переполнения FIFO
+	int err_skipped_frame;	    //ошибок пропуск кадров
+    int err_frame_header;       //ошибок начала кадра 
+    int err_msb_byte;           //ошибок в данных фрейма
+    int err_frame_close_byte;   //ошибок конца кадра
+    int err_time_out;           //таймаутов на приеме 
 };
 
-struct pov_dev channels[ MAX_CHANNELS ] = {
+struct pov_dev channels[MAX_CHANNELS] = {
 	//ПОВ1
 	[0].fifo8_port = 0x150,
  	[0].count_port = 0x154,
   	[0].state_port = 0x158,
 
-	[1].fifo8_port = 0x151,
+    [1].fifo8_port = 0x151,
   	[1].count_port = 0x156,
   	[1].state_port = 0x158,
 
@@ -171,39 +183,70 @@ struct pov_dev channels[ MAX_CHANNELS ] = {
 int pov_major, pov_minor;
 dev_t dev;
 static struct class *pov_class;
-struct timespec timestamp;
 //Период между отсчетами
-s64 count_duration_ns;
-//Период между аналогами внутри отсчета 
-s64 analog_duration_ns;
+int count_duration_ns;
+//Период между 16 квантами внутри отсчета
+//4(2+2),2,2,2,2,2,2,2,2,2,2,2,2,2,2,3(2+1)
+int quantum_duration_ns;
+
+static int pov_proc_output (char *buf)
+{
+	int i;
+	char *p = buf;
+    for (i = 0; i < MAX_CHANNELS; i++) {
+        struct pov_dev *dev = &channels[i];
+        if (dev->state != STATE_UNUSED) {
+            p += sprintf(p, "pov\t\t\t:%d\n", i);
+            p += sprintf(p, "irq_counter\t\t:%lld\n", irq_counter);
+            p += sprintf(p, "read_counter\t\t:%lld\n", dev->read_counter);
+            p += sprintf(p, "bytes_read\t\t:%lld\n", dev->bytes_read);
+            p += sprintf(p, "err_fifo_overflow\t:%d\n", dev->err_fifo_overflow);
+            p += sprintf(p, "err_skipped_frame\t:%d\n", dev->err_skipped_frame);
+            p += sprintf(p, "err_frame_header\t:%d\n", dev->err_frame_header);
+            p += sprintf(p, "err_msb_byte\t\t:%d\n", dev->err_msb_byte);
+            p += sprintf(p, "err_frame_close_byte\t:%d\n", 
+                    dev->err_frame_close_byte);
+            p += sprintf(p, "err_time_out\t\t:%d\n", dev->err_time_out);
+            p += sprintf(p, "\n");
+        }
+    }
+
+	return p - buf;
+}
+
+static int pov_read_proc(char *page, char **start, off_t off,
+			   int count, int *eof, void *data)
+{
+	int len = pov_proc_output(page);
+	if (len <= off+count)
+		*eof = 1;
+	*start = page + off;
+	len -= off;
+	if (len > count)
+		len = count;
+	if (len < 0)
+		len = 0;
+	return len;
+}                
 
 static void dev_start(struct pov_dev *dev)
 {
-    unsigned short count;
-	unsigned char state = inb(dev->state_port);
-    count = inw(dev->count_port);
-    printk(KERN_DEBUG "pov: start cur state:%x count:%x\n", state, count);
-	//порт фифо А четный, а В - нечетный
+    unsigned char state = inb(dev->state_port);
+    spin_lock_irq(&irq_lock);
+	//Порт фифо А четный, а В - нечетный
 	state |= (dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
-    count = inw(dev->count_port);
-    printk(KERN_DEBUG "pov: start set state:%x count:%x\n", state, count);
-    outb(0, dev->fifo8_port);
+    spin_unlock_irq(&irq_lock);
 }
 
 static void dev_stop(struct pov_dev *dev)
 {
-    unsigned short count;
-	unsigned char state = inb(dev->state_port);
-    count = inw(dev->count_port);
-    printk(KERN_DEBUG "pov: stop cur state:%x count:%x\n", state, count);
-	//порт фифо А четный, а В - нечетный
+    unsigned char state = inb(dev->state_port);
+    spin_lock_irq(&irq_lock);
+    //порт фифо А четный, а В - нечетный
 	state &= ~(dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
-    count = inw(dev->count_port);
-    printk(KERN_DEBUG "pov: stop set state:%x count:%x\n", state, count);
-    printk(KERN_DEBUG "pov: irq_counter:%lld work_counter:%lld\n", 
-        irq_counter, work_counter);
+    spin_unlock_irq(&irq_lock);
 }
 
 static void dev_hard_error(struct pov_dev *dev, int err)
@@ -225,6 +268,26 @@ static int  dev_calc_data_count(struct pov_dev *dev, int count)
 	return res;
 }
 
+static void reset(struct pov_dev *dev)
+{
+	dev->cur_fifo_counter = 0;
+	dev->last_fifo_counter = 0;
+	dev->parse_state = PARSE_INITIAL;
+	dev->last_frame_num = -1;
+    dev->first_sample_flag = 1;
+    dev->bytes_in_fifo = 0;
+    dev->bytes_from_pu = -1;
+    dev->pu_freq_period_ns = 0;
+}
+
+static void restart(struct pov_dev *dev)
+{
+	dev->parse_state = PARSE_INITIAL;
+	dev->last_frame_num = -1;
+    dev->bytes_from_pu = -1;
+    dev->pu_freq_period_ns = 0;
+} 
+
 static int dev_open( struct pov_dev *dev )
 {
 	if (dev->state == STATE_UNUSED)
@@ -235,18 +298,16 @@ static int dev_open( struct pov_dev *dev )
 
 	dev->error = 0;
 
+    reset(dev);
+   
+    dev->read_counter = 0;
     dev->bytes_read = 0;
-	dev->cur_fifo_counter = 0;
-	dev->last_fifo_counter = 0;
-	dev->parse_state = PARSE_INITIAL;
-	dev->last_frame = -1;
-    
-    mutex_init(&dev->mut);
-    dev->buf = 0;
-    dev->buf_size = 0;
-
-	dev->err_fifo_overflows = 0;
-	dev->err_skipped_frames = 0;
+	dev->err_fifo_overflow = 0;
+	dev->err_skipped_frame = 0;
+    dev->err_frame_header = 0;
+    dev->err_msb_byte = 0; 
+    dev->err_frame_close_byte = 0;
+    dev->err_time_out = 0;
 
 	dev->state = STATE_OPENED;
 	dev_start(dev);
@@ -261,7 +322,6 @@ static int dev_release(struct pov_dev *dev)
 	if (dev->state != STATE_CLOSED)	{
 		if (dev->state == STATE_OPENED)
             dev_stop(dev);
-        mutex_destroy(&dev->mut);
 		dev->state = STATE_CLOSED;
     }
 
@@ -269,17 +329,18 @@ static int dev_release(struct pov_dev *dev)
 }
 
 
-static void adjust_timestamp(struct timespec *ts, int bytes_initially, 
-    int bytes_rest)
+static void adjust_timestamp(struct timespec *ts, int bytes_in_fifo)
 {
-    s64 ns1, ns2;
-    ns1 = count_duration_ns*bytes_initially;
-    ns1 = do_div(ns1, POV_FRAME_SIZE);
-    //FIXME Число аналогов не должно быть больше 16, 
-    //а bytes_initially - bytes_rest > 35
-    ns2 = analog_duration_ns*(bytes_initially - bytes_rest);
-    ns2 = do_div(ns2, 16);
-    timespec_add_ns(ts, -(ns1+ns2));
+    int pending_bytes = bytes_in_fifo%POV_FRAME_SIZE;
+    int duration_ns = bytes_in_fifo/POV_FRAME_SIZE*count_duration_ns;
+    int pending_quantums;
+
+    if (pending_bytes < 5)
+        pending_quantums = 0;
+    else
+        pending_quantums = (pending_bytes-4+1)/2;
+    duration_ns += pending_quantums*quantum_duration_ns;  
+    *ts = timespec_sub(*ts, ns_to_timespec(duration_ns));
 }
 
 static void shift_timestamp(struct timespec *ts)
@@ -287,130 +348,23 @@ static void shift_timestamp(struct timespec *ts)
     timespec_add_ns(ts, count_duration_ns);
 }
 
+static void calibrate_pu(int *pu_freq_period_ns, long long bytes_from_pu, 
+    struct timespec begin_time, struct timespec end_time)
+{
+    if (bytes_from_pu) {
+        struct timespec sub = timespec_sub(end_time, begin_time);
+        s64 ns = timespec_to_ns(&sub)*(s64)(POV_FRAME_SIZE);
+        do_div(ns, bytes_from_pu);
+        *pu_freq_period_ns = (int)ns;
+    }
+}
+
+
+
 static void dev_read(struct pov_dev *dev)
 {
-    struct timespec ts, *pts;
-    int fifo_counter;
-    int bytes_initially, bytes_rest;
-    
-    //Сохранить время и счетчик
-    spin_lock_irq(&irq_lock);
-    ts = timestamp;
-    fifo_counter = dev->cur_fifo_counter;
-    spin_unlock_irq(&irq_lock);
-
-    mutex_lock(&dev->mut);
-    if (dev->state == STATE_OPENED && dev->buf_size) {
-        unsigned char byte;
-        int timestamp_adjusted = 0;
-        int skipped_frames;
- 
-        if (fifo_counter & AD_OVERFLOW) {
-            dev->err_fifo_overflows++;
-            printk(KERN_DEBUG "pov: overflow:%x\n", fifo_counter);
-            goto err_exit;
-        }
-        
-        fifo_counter &= COUNTER_MASK;
-        bytes_rest = bytes_initially = dev_calc_data_count(dev, fifo_counter);
-
-        while (bytes_rest && dev->buf_size) {
-            byte = inb(dev->fifo8_port);
-            dev->bytes_read++;
-            bytes_rest--; 
-retry:
-            switch (dev->parse_state) {
-                case PARSE_INITIAL:	{
-                    if ((byte & 0xC0) == 0x80) {
-                        dev->parse_state = PARSE_HEAD;
-                        dev->cur_frame = byte & FRAME_COUNTER_MASK;
-                    }
-                    break;
-                }
-                case PARSE_HEAD: {
-                    if ((byte & 0xCF) == 0x80) {
-                        if (!timestamp_adjusted) { 
-                            adjust_timestamp(&ts, bytes_initially, bytes_rest);
-                            timestamp_adjusted = 1;
-                            ts.tv_nsec |= START_COUNT_FLAG;
-                        } else {
-                            shift_timestamp(&ts);
-                            ts.tv_nsec &= ~START_COUNT_FLAG;
-                        }
-
-                        if (dev->last_frame == -1)
-                            dev->last_frame = dev->cur_frame - 1;
-                        skipped_frames = dev->cur_frame - dev->last_frame;
-                        if (skipped_frames < 0)
-                            skipped_frames += MAX_FRAME_COUNTER;
-                        if (--skipped_frames > 0) {
-                            dev->err_skipped_frames++;
-                            printk(KERN_DEBUG "pov:skipped_frames:%d\n", 
-                                skipped_frames);
-                            goto err_exit;
-                        }        
-                        pts = (struct timespec *)dev->buf;
-                        put_user(ts, pts);
-                        dev->buf += sizeof(struct timespec);
-                        dev->buf_size -= sizeof(struct timespec);
-                        dev->idx = 0;
-                        dev->parse_state = PARSE_MSB;
-                    } else if (dev->last_frame == -1) {
-                        dev->parse_state = PARSE_INITIAL;
-                        goto retry;
-                    } else {                               
-                        printk(KERN_DEBUG "pov:not head2 byte:%d\n", byte);
-                        goto err_exit;
-                    }
-                    break;
-                }
-                case PARSE_MSB: {
-                    if (byte & ~MSB_MASK) {
-                        printk(KERN_DEBUG "pov:not MSB byte:%d\n", byte);
-                        goto err_exit;
-                    }
-                    put_user(byte, dev->buf);
-                    dev->buf++;
-                    dev->buf_size--;
-                    dev->parse_state = PARSE_LSB;
-                    break;
-                }
-                case PARSE_LSB: {
-                    put_user(byte, dev->buf);
-                    dev->buf++;
-                    dev->buf_size--;
-                    if (++(dev->idx) == 16) {
-                        dev->last_frame = dev->cur_frame;
-                        dev->parse_state = PARSE_TAIL;
-                    }
-                    else
-                        dev->parse_state = PARSE_MSB;
-                    break;
-                }
-                case PARSE_TAIL: {
-                    if (byte != FRAME_CLOSE_BYTE) {
-                        printk(KERN_DEBUG "pov:not frame close byte:%d\n", byte);
-                        goto err_exit;
-                    }
-                    dev->parse_state = PARSE_INITIAL;
-                    break;
-                }
-            }
-        }
-        if (!dev->buf_size)
-            complete(&dev->compl);
-    }       
-    mutex_unlock(&dev->mut);
-    return;
-
-err_exit:
-    //FIXME Не выходить с ошибкой, а выйти
-    //из функции, чтобы после обновления метки времени
-    //начать новый блок данных, не забыв сдвинуться назад 
-    //в буфере клиента
-    dev_hard_error(dev, -EIO);
-    complete(&dev->compl);
-    mutex_unlock(&dev->mut);
+    if (!completion_done(&dev->compl))
+        complete(&dev->compl);
 }
  
 static int pov_open(struct inode *inode, struct file *filp)
@@ -437,20 +391,15 @@ static int pov_release(struct inode *inode, struct file *filp)
 irqreturn_t pov_irq_handler(int irq, void *dev_id)
 {
     int i = 0;
+    struct pov_dev *dev;
     irq_counter++;
-    
-    //Считать текущее время
-    getnstimeofday(&timestamp); 
 
-    //Считать счетчики
-	for (; i < MAX_CHANNELS; i++) {
-		struct pov_dev * dev = &channels[i];
-		if (dev->state != STATE_UNUSED) {
-  			//Заодно сбросить прерывания
+    //Сбросить прерывания
+ 	for (; i < MAX_CHANNELS; i++) {
+		dev = &channels[i];
+		if (dev->state != STATE_UNUSED)
 			inb(dev->state_port);
-		    dev->cur_fifo_counter = inw(dev->count_port);
-        }
-    }
+    } 
 
 	queue_work(work_queue, &work);
 	return IRQ_HANDLED;
@@ -463,45 +412,187 @@ static void pov_do_work(struct work_struct *w)
     work_counter++;
     for (; i < MAX_CHANNELS; i++) {
 		struct pov_dev *dev = &channels[i];
-		if (dev->state != STATE_UNUSED)
+		if (dev->state == STATE_OPENED)
             dev_read(dev);
     }
 }
 
-static ssize_t pov_read( struct file *filp, char *buf, size_t count, loff_t *f_pos )
+static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_pos )
 {
 	struct pov_dev *dev = filp->private_data;
 	int ret = 0;
-    int timeout_in_jiffies = (count+FIFO_SIZE)*HZ/(sizeof(struct sample)*sample_rate);
+    int bytes_to_read;
+    struct timespec ts;
+    int fifo_counter;
     
     if (dev->state != STATE_OPENED)
         return -ENODEV;
 
-    count *= sizeof(struct sample)/sizeof(struct sample);
-    if (!count)
+    size *= sizeof(struct sample)/sizeof(struct sample);
+    if (!size)
         return -EINVAL;
 
-    mutex_lock(&dev->mut);
-    dev->buf = buf;
-    dev->buf_size = count;
-    init_completion(&dev->compl);
-    mutex_unlock(&dev->mut);
-    
-    ret = wait_for_completion_interruptible_timeout(&dev->compl, timeout_in_jiffies);
-    
-    mutex_lock(&dev->mut);
-    if (ret < 0)
-        dev_hard_error(dev, ret);
-    else if (ret == 0 && dev->buf_size)
-        dev_hard_error(dev, -ETIMEDOUT);
+    dev->read_counter++;
 
-    if (dev->state != STATE_OPENED)
-        return dev->error;
-    else
-        ret = count - dev->buf_size;
-    mutex_unlock(&dev->mut);
+    bytes_to_read = size;
 
+    while (1) {
+        unsigned char byte;
+        int timestamp_adjusted = 0;
+        int skipped_frames;
+        int timeout_in_jiffies; 
+        int new_bytes;
+
+        //Сохранить время и счетчик
+        spin_lock_irq(&irq_lock);
+        getnstimeofday(&ts); 
+        fifo_counter = inw(dev->count_port);
+        spin_unlock_irq(&irq_lock);
+ 
+        if (fifo_counter & AD_OVERFLOW) {
+            dev->err_fifo_overflow++;
+            printk(KERN_WARNING "pov%d: FIFO overflow:%x\n", 
+                    dev->index, fifo_counter);
+            dev_stop(dev);
+            reset(dev);
+            dev_start(dev);
+            continue;
+        }
+        
+        fifo_counter &= COUNTER_MASK;
+        new_bytes = dev_calc_data_count(dev, fifo_counter);
+        dev->bytes_in_fifo += new_bytes;
+
+        //Данные для калибровки ПУ
+        dev->end_time = ts;
+        if (dev->bytes_from_pu == -1) {
+            dev->begin_time = ts;
+            dev->bytes_from_pu = 0;
+        }
+        else {
+            dev->bytes_from_pu += new_bytes;
+            calibrate_pu(&dev->pu_freq_period_ns, dev->bytes_from_pu, 
+                dev->begin_time, dev->end_time);
+        }
+        while (dev->bytes_in_fifo && size) {
+            byte = inb(dev->fifo8_port);
+            dev->bytes_read++;
+            dev->bytes_in_fifo--; 
+retry:
+            switch (dev->parse_state) {
+                case PARSE_INITIAL:	{
+                    if ((byte & 0xC0) == 0x80) {
+                        dev->parse_state = PARSE_HEAD;
+                        dev->cur_frame_num = byte & FRAME_COUNTER_MASK;
+                    }
+                    break;
+                }
+                case PARSE_HEAD: {
+                    if ((byte & 0xCF) == 0x80) {
+                        if (dev->last_frame_num == -1)
+                            dev->last_frame_num = dev->cur_frame_num - 1;
+                        skipped_frames = dev->cur_frame_num - 
+                            dev->last_frame_num;
+                        if (skipped_frames < 0)
+                            skipped_frames += MAX_FRAME_COUNTER;
+                        if (--skipped_frames > 0) {
+                            dev->err_skipped_frame++;
+                            printk(KERN_WARNING "pov%d: Skipped frames:%d\n", 
+                                dev->index, skipped_frames);
+                            restart(dev);
+                            goto retry;
+                        }
+                        if (!timestamp_adjusted) { 
+                            adjust_timestamp(&ts, dev->bytes_in_fifo+2);
+                            timestamp_adjusted = 1;
+                        } else
+                            shift_timestamp(&ts);
+                        
+                        if (dev->first_sample_flag) {
+                            ts.tv_nsec |= FIRST_SAMPLE_FLAG;
+                            dev->first_sample_flag = 0;
+                        } else
+                            ts.tv_nsec &= ~FIRST_SAMPLE_FLAG;
+
+                        dev->cur_sample.timestamp = ts;
+                        dev->data_byte_idx = 0;
+                        dev->parse_state = PARSE_MSB;
+                    } else if (dev->last_frame_num == -1) {
+                        dev->parse_state = PARSE_INITIAL;
+                        goto retry;
+                    } else {                          
+                        dev->err_frame_header++;    
+                        printk(KERN_WARNING 
+                                "pov%d: Bad frame header second byte:%d\n", 
+                                dev->index, byte);
+                        restart(dev);
+                        goto retry;
+                    }
+                    break;
+                }
+                case PARSE_MSB: {
+                    if (byte & ~MSB_MASK) {
+                        dev->err_msb_byte++;
+                        printk(KERN_WARNING "pov%d: Bad msb byte:%d\n", 
+                                dev->index, byte);
+                        restart(dev);
+                        goto retry;
+                    }
+                    dev->cur_sample.data[dev->data_byte_idx++] = byte;
+                    dev->parse_state = PARSE_LSB;
+                    break;
+                }
+                case PARSE_LSB: {
+                    dev->cur_sample.data[dev->data_byte_idx++] = byte;
+                    if (dev->data_byte_idx == 32) {
+                        dev->last_frame_num = dev->cur_frame_num;
+                        dev->parse_state = PARSE_TAIL;
+                    }
+                    else
+                        dev->parse_state = PARSE_MSB;
+                    break;
+                }
+                case PARSE_TAIL: {
+                    if (byte != FRAME_CLOSE_BYTE) {
+                        dev->err_frame_close_byte++;
+                        printk(KERN_WARNING "pov%d: Bad frame close byte:%d\n", 
+                                dev->index, byte);
+                        restart(dev);
+                        goto retry;
+                    }
+                    dev->parse_state = PARSE_INITIAL;
+                    copy_to_user(buf, &dev->cur_sample, sizeof(struct sample));
+                    buf += sizeof(struct sample);
+                    size -= sizeof(struct sample);
+                    break;
+                }
+            }
+        }
+        if (!size) {
+            ret = bytes_to_read - size;
+            break;
+        }
+        
+        timeout_in_jiffies = (size+FIFO_SIZE)*HZ/
+            (sizeof(struct sample)*sample_rate);
+        init_completion(&dev->compl);
+        
+        ret = wait_for_completion_interruptible_timeout(&dev->compl, 
+            timeout_in_jiffies);
+        
+        if (ret < 0)
+            goto err_exit;
+        else if (ret == 0) {
+            //ETIMEDOUT
+            printk(KERN_WARNING "pov%d: Data read time-out\n", dev->index);
+            dev->err_time_out++;
+            break;
+        }
+    }
     return ret;
+err_exit:
+    dev_hard_error(dev, ret);
+    return ret; 
 }
                           
 struct file_operations pov_fops = {
@@ -516,7 +607,7 @@ static int pov_setup_cdev(struct pov_dev *dev, int index)
 	int err = 0, devno = MKDEV(pov_major, pov_minor + index);
 
 	cdev_init(&dev->cdev, &pov_fops);
-    device_create(pov_class,  0, devno, 0, "pov%d", index);
+    device_create(pov_class, 0, devno, 0, "pov%d", index);
 	dev->cdev.owner = THIS_MODULE;
 	dev->cdev.ops = &pov_fops;
 	err = cdev_add(&dev->cdev, devno, 1);
@@ -533,7 +624,9 @@ static int __init pov_init_module(void)
 {
 	int err = -ENODEV, i;
 	int quotient, remainder;
-	//проверка параметров
+	struct proc_dir_entry *ent;
+	
+    //проверка параметров
 	if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
 		printk(KERN_WARNING "pov: unsupported irq number %d\n", irq);
 		err = -EINVAL;
@@ -568,10 +661,11 @@ static int __init pov_init_module(void)
 
 	for (i=0; i < MAX_CHANNELS; i++)
 		if (pov_mask & BIT(i)) {
+            channels[i].index = i;
 			channels[i].state = STATE_CLOSED;
-			err = pov_setup_cdev( &channels[i], i );
+			err = pov_setup_cdev(&channels[i], i);
 			if (err) {
-				printk(KERN_WARNING "pov: device pov%d setup error\n",  i);
+				printk(KERN_WARNING "pov: device pov%d setup error\n", i);
 				goto out_dev;
 			}
 		}
@@ -590,9 +684,13 @@ static int __init pov_init_module(void)
 		goto out_queue;
     }
 
+	ent = create_proc_read_entry("driver/pov", 0, NULL, pov_read_proc, NULL);
+	if (!ent)
+		printk(KERN_WARNING "pov: unable to create /proc entry.\n");
+
     spin_lock_init(&irq_lock);
     count_duration_ns = 1000000000/sample_rate;
-    analog_duration_ns = count_duration_ns/16;
+    quantum_duration_ns = count_duration_ns/16;
     
     INIT_WORK(&work, pov_do_work);
 
@@ -606,7 +704,7 @@ out_dev:
  	for (i=0; i < MAX_CHANNELS; i++)
 		if (channels[i].state != STATE_UNUSED) { 
             device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
-            cdev_del( &channels[ i ].cdev );    
+            cdev_del(&channels[i].cdev);    
         }
 out_class:
 	unregister_chrdev_region(dev, MAX_CHANNELS);
@@ -628,9 +726,9 @@ static void __exit pov_exit_module(void)
     destroy_workqueue(work_queue);
 
 	for (i = 0; i < MAX_CHANNELS; i++)
-		if (channels[ i ].state != STATE_UNUSED) {
+		if (channels[i].state != STATE_UNUSED) {
             device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
-			cdev_del( &channels[ i ].cdev );
+			cdev_del(&channels[i].cdev);
         }
 	class_destroy(pov_class);
     unregister_chrdev_region(dev, MAX_CHANNELS);
