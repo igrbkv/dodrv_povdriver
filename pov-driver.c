@@ -27,6 +27,9 @@
 частота	дискретизации - sample_rate (по умолчанию 1800)
 5. Соответствующие каналам названия устройств в драйвере: 
 ПОВ1/1 - /dev/pov0, ПОВ1/2 - /dev/pov1,..., ПОВ4/2 - /dev/pov7
+6. 32 байта данных фрейма преобразуются в массив из 16 short.
+7. Порядок прихода сигналов 16,1,2,3,...,15 меняется в отсчете
+на правильный - 1,2,...,16
 */
 
 #define MAX_BOARDS	4
@@ -97,7 +100,7 @@ enum parse_states {
 
 struct sample {
     struct timespec timestamp;
-    unsigned char data[FRAME_DATA_SIZE];
+    short data[FRAME_DATA_SIZE/2];
 };
 
 struct pov_dev {
@@ -117,7 +120,7 @@ struct pov_dev {
 	int cur_frame_num;	   	    //Номер разбираемого фрейма
 	int last_frame_num;	   	    //Номер последнего разобранного 
                                 //фрейма (из заголовка фрейма)
-	int data_byte_idx;	        //Текущий байт фрейма
+	int data_idx;	            //Текущий индекс фрейма
     int first_sample_flag;      //Флаг начала данных
     struct sample cur_sample;
 
@@ -131,6 +134,8 @@ struct pov_dev {
     struct timespec end_time;
     long long bytes_from_pu;
     
+    int last_ret;               //Значение функции read
+
     //статистика
     long long read_counter;
 	long long bytes_read;
@@ -299,7 +304,9 @@ static int dev_open( struct pov_dev *dev )
 	dev->error = 0;
 
     reset(dev);
-   
+
+    dev->last_ret = -1;
+    
     dev->read_counter = 0;
     dev->bytes_read = 0;
 	dev->err_fifo_overflow = 0;
@@ -515,7 +522,7 @@ retry:
                             ts.tv_nsec &= ~FIRST_SAMPLE_FLAG;
 
                         dev->cur_sample.timestamp = ts;
-                        dev->data_byte_idx = 0;
+                        dev->data_idx = 0;
                         dev->parse_state = PARSE_MSB;
                     } else if (dev->last_frame_num == -1) {
                         dev->parse_state = PARSE_INITIAL;
@@ -538,13 +545,14 @@ retry:
                         restart(dev);
                         goto retry;
                     }
-                    dev->cur_sample.data[dev->data_byte_idx++] = byte;
+                    dev->cur_sample.data[dev->data_idx] = byte<<8;
                     dev->parse_state = PARSE_LSB;
                     break;
                 }
                 case PARSE_LSB: {
-                    dev->cur_sample.data[dev->data_byte_idx++] = byte;
-                    if (dev->data_byte_idx == 32) {
+                    dev->cur_sample.data[dev->data_idx] |= byte;
+                    dev->data_idx++;
+                    if (dev->data_idx == 16) {
                         dev->last_frame_num = dev->cur_frame_num;
                         dev->parse_state = PARSE_TAIL;
                     }
@@ -553,6 +561,8 @@ retry:
                     break;
                 }
                 case PARSE_TAIL: {
+                    struct sample s;
+                    int i;
                     if (byte != FRAME_CLOSE_BYTE) {
                         dev->err_frame_close_byte++;
                         printk(KERN_WARNING "pov%d: Bad frame close byte:%d\n", 
@@ -561,6 +571,12 @@ retry:
                         goto retry;
                     }
                     dev->parse_state = PARSE_INITIAL;
+                    //Порядок прихода сигналов 16,1,2,...,15
+                    //поэтому:
+                    s = dev->cur_sample;
+                    for (i=1; i < 16; i++)
+                        dev->cur_sample.data[i-1] = s.data[i];
+                    dev->cur_sample.data[15] = s.data[0];
                     copy_to_user(buf, &dev->cur_sample, sizeof(struct sample));
                     buf += sizeof(struct sample);
                     size -= sizeof(struct sample);
@@ -584,14 +600,17 @@ retry:
             goto err_exit;
         else if (ret == 0) {
             //ETIMEDOUT
-            printk(KERN_WARNING "pov%d: Data read time-out\n", dev->index);
+            if (dev->last_ret)
+                printk(KERN_WARNING "pov%d: Data read time-out\n", dev->index);
             dev->err_time_out++;
             break;
         }
     }
-    return ret;
+    goto exit;
 err_exit:
     dev_hard_error(dev, ret);
+exit:
+    dev->last_ret = ret;
     return ret; 
 }
                           
