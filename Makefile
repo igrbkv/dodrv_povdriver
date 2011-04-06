@@ -1,3 +1,4 @@
+SYSROOT = /usr/i586-pc-linux-gnu
 TARGET = pov
 OBJS = pov-driver.o
 # device.o
@@ -5,9 +6,9 @@ MDIR = drivers/misc
 
 EXTRA_CFLAGS = -DEXPORT_SYMTAB
 CURRENT = $(shell uname -r)
-KDIR = /lib/modules/$(CURRENT)/build
+KDIR = $(SYSROOT)/lib/modules/$(CURRENT)/build
 PWD = $(shell pwd)
-DEST = /lib/modules/$(CURRENT)/kernel/$(MDIR)
+DEST = $(SYSROOT)/lib/modules/$(CURRENT)/kernel/$(MDIR)
 
 obj-m      += pov.o
 $(TARGET)-objs = $(OBJS)

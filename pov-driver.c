@@ -27,6 +27,7 @@
 частота	дискретизации - sample_rate (по умолчанию 1800)
 5. Соответствующие каналам названия устройств в драйвере: 
 ПОВ1/1 - /dev/pov0, ПОВ1/2 - /dev/pov1,..., ПОВ4/2 - /dev/pov7
+Существующие устройства определяются автоматически(Plug&Play).
 6. 32 байта данных фрейма преобразуются в массив из 16 short.
 7. Порядок прихода сигналов 16,1,2,3,...,15 меняется в отсчете
 на правильный - 1,2,...,16
@@ -69,8 +70,7 @@ module_param(irq, int, S_IRUGO);
 #define POV42 0x80
 #define POV_MASK	(POV11|POV12|POV21|POV22|POV31|POV32|POV41|POV42)
 
-static int pov_mask = (POV11|POV12|POV21|POV22);
-module_param(pov_mask, int, S_IRUGO);
+static int pov_mask = POV_MASK;
 
 //частота переменного тока
 #define AC_FREQUENCY	50
@@ -679,7 +679,8 @@ static int __init pov_init_module(void)
 
 
 	for (i=0; i < MAX_CHANNELS; i++)
-		if (pov_mask & BIT(i)) {
+        //PnP 13-й бит счетчика всегда 0
+        if (~inw(channels[i].count_port) & BIT(13)) {
             channels[i].index = i;
 			channels[i].state = STATE_CLOSED;
 			err = pov_setup_cdev(&channels[i], i);
