@@ -18,16 +18,30 @@
 
 #include "pov.h"
 /*
-1. Все платы сидят на одном прерывании (один обработчик прерывания)
-возможные IRQ - 5,7,10,11,12
-2. Все платы работают на одной частоте 1800/3600 Гц
-3. Данные из фреймов переписываются в буфер пользователя как есть
-4. Параметры: номер перывания - irq (по умолчанию 7), 
-маска используемых каналов - pov_mask(по умолчанию 15, ПОВ1 и ПОВ2), 
-частота	дискретизации - sample_rate (по умолчанию 1800)
-5. Соответствующие каналам названия устройств в драйвере: 
+1. Соответствующие каналам названия устройств в драйвере: 
 ПОВ1/1 - /dev/pov0, ПОВ1/2 - /dev/pov1,..., ПОВ4/2 - /dev/pov7
 Существующие устройства определяются автоматически(Plug&Play).
+Параметры драйвера задаются в файле 
+/etc/conf.d/modules
+2. Внимание! Платы ПОВ не умеют разделять прерывания с
+другими устройствами, в том числе другими платами ПОВ.
+#ifdef COMMON_SHARED_IRQ
+Все платы сидят на одном прерывании (один обработчик прерывания)
+возможные IRQ - 5,7,10,11,12
+Номер перывания - параметр irq (по умолчанию 7)  
+#else
+Каждая плата сидит на своем IRQ. По умолчанию: 
+ПОВ1 - IRQ5
+ПОВ2 - IRQ7
+и т.д.
+Для изменения номеров прерываний использовать параметры
+brd1_irq, brd2_irq, brd3_irq, brd4_irq
+#endif
+2. Все платы работают на одной частоте 1800/3600 Гц
+3. Данные из фреймов переписываются в буфер пользователя как есть
+4. Параметры: 
+маска используемых каналов - pov_mask(по умолчанию 15, ПОВ1 и ПОВ2), 
+частота	дискретизации - sample_rate (по умолчанию 1800)
 6. 32 байта данных фрейма преобразуются в массив из 16 short.
 7. Порядок прихода сигналов 16,1,2,3,...,15 меняется в отсчете
 на правильный - 1,2,...,16
@@ -55,10 +69,21 @@ struct workqueue_struct *work_queue;
 static struct work_struct work;
 spinlock_t irq_lock = SPIN_LOCK_UNLOCKED;
 
+#ifdef COMMON_SHARED_IRQ
 #define DEFAULT_IRQ 7	//или 12 (PS/2 мышь)
 static int irq = DEFAULT_IRQ;
 module_param(irq, int, S_IRUGO);
-
+#else
+static int irqmask = 0;
+static int brd1_irq = 5;
+static int brd2_irq = 7;
+static int brd3_irq = 10;
+static int brd4_irq = 11;
+module_param(brd1_irq, int, S_IRUGO);
+module_param(brd2_irq, int, S_IRUGO);
+module_param(brd3_irq, int, S_IRUGO);
+module_param(brd4_irq, int, S_IRUGO);
+#endif
 //Маска задействованных каналов
 #define POV11 0x1
 #define POV12 0x2
@@ -435,9 +460,10 @@ static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_po
     if (dev->state != STATE_OPENED)
         return -ENODEV;
 
-    size *= sizeof(struct sample)/sizeof(struct sample);
+    size /= sizeof(struct sample);
     if (!size)
         return -EINVAL;
+    size *= sizeof(struct sample);
 
     dev->read_counter++;
 
@@ -645,12 +671,38 @@ static int __init pov_init_module(void)
 	int quotient, remainder;
 	struct proc_dir_entry *ent;
 	
+#ifdef COMMON_SHARED_IRQ
     //проверка параметров
 	if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
 		printk(KERN_WARNING "pov: unsupported irq number %d\n", irq);
 		err = -EINVAL;
 		goto out_param;
 	}
+#else
+    //Проверить, что номера прерываний у имеющихся ПОВ различны
+    int installed_irq = 0;
+    int irqs[MAX_BOARDS]; 
+    irqs[0] = brd1_irq;
+    irqs[1] = brd2_irq;
+    irqs[2] = brd3_irq;
+    irqs[3] = brd4_irq;
+    for (i=0; i < MAX_CHANNELS; i+=2)
+        //PnP 13-й бит счетчика всегда 0
+        if (~inw(channels[i].count_port) & BIT(13)) {
+            int irq = irqs[i/2];
+            if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
+                printk(KERN_WARNING "pov: unsupported irq number %d\n", irq);
+                err = -EINVAL;
+                goto out_param;
+            }
+            if (irqmask & BIT(irqs[i/2])) {
+                printk(KERN_WARNING "pov: IRQ%d already in use\n", irqs[i/2]);
+                err = -EINVAL;
+                goto out_param;
+            }
+            irqmask |= BIT(irqs[i/2]);
+		}
+#endif
 
 	quotient = sample_rate/BASE_SAMPLE_RATE; 
     remainder = sample_rate%BASE_SAMPLE_RATE;
@@ -696,13 +748,27 @@ static int __init pov_init_module(void)
 		goto out_dev;
     }
 
+#ifdef COMMON_SHARED_IRQ
     //Запросить прерывание в совместное пользование, 
     //в качестве уникального идентификатора - pov_major
-	err = request_irq( irq, pov_irq_handler, IRQF_SHARED, "pov", &pov_major );
+	err = request_irq(irq, pov_irq_handler, IRQF_SHARED, "pov", &pov_major);
 	if (err) {
 		printk(KERN_WARNING "pov: installing an interrupt handler for irq %d failed\n", irq);
 		goto out_queue;
     }
+#else
+    for (i = 5; i <= 12; i++) { // IRQ5 - IRQ12
+        if (irqmask & BIT(i)) {
+            err = request_irq(i, pov_irq_handler, IRQF_SHARED, "pov", &pov_major);
+            if (err) {
+                printk(KERN_WARNING "pov: installing an interrupt handler for irq %d failed\n", i);
+                irqmask = installed_irq;
+                goto out_irq;
+            }
+            installed_irq |= BIT(i);
+        }
+    }
+#endif
 
 	ent = create_proc_read_entry("driver/pov", 0, NULL, pov_read_proc, NULL);
 	if (!ent)
@@ -714,10 +780,23 @@ static int __init pov_init_module(void)
     
     INIT_WORK(&work, pov_do_work);
 
+#ifdef COMMON_SHARED_IRQ
     printk(KERN_INFO "pov: init sample_rate=%d irq=%d  pov_mask=%d\n", sample_rate, irq, pov_mask);
-
+#else
+    for (i = 0; i < MAX_BOARDS; i++)
+        if (irqmask | BIT(irqs[i]))
+            printk(KERN_INFO "pov: board=%d init sample_rate=%d irq=%d\n", i, sample_rate, irqs[i]);
+#endif
+    printk(KERN_INFO "pov: init\n");
     return 0;
+#ifdef COMMON_SHARED_IRQ
 out_queue:
+#else
+out_irq:
+    for (i = 5; i <= 12; i++)   // IRQ5 - IRQ12
+        if (irqmask & BIT(i))
+            free_irq(i, NULL);
+#endif
     destroy_workqueue(work_queue);
 out_dev: 
 	class_destroy(pov_class);
@@ -730,16 +809,24 @@ out_class:
 	unregister_chrdev_region(dev, MAX_CHANNELS);
 out_region:
 out_param:
+    printk(KERN_INFO "pov: init err=%d\n", err);
 	return err;
 }
 
 static void __exit pov_exit_module(void)
 {
 	int i;
+    printk(KERN_INFO "pov: exit\n");
     for (i = 0; i < MAX_CHANNELS; i++)
         dev_release(&channels[i]);
 
+#ifdef COMMON_SHARED_IRQ
 	free_irq(irq, &pov_major);
+#else
+    for (i = 5; i <= 12; i++)   // IRQ5 - IRQ12
+        if (irqmask & BIT(i))
+           free_irq(i, NULL); 
+#endif
 
     cancel_work_sync(&work);
     flush_workqueue(work_queue);
