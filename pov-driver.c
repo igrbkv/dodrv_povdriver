@@ -15,6 +15,7 @@
 #include <asm/uaccess.h>
 #include <linux/cdev.h>
 #include <linux/time.h>
+#include <linux/kfifo.h>
 
 #include "pov.h"
 /*
@@ -23,6 +24,15 @@
 Существующие устройства определяются автоматически(Plug&Play).
 Параметры драйвера задаются в файле 
 /etc/conf.d/modules
+
+#ifdef USE_POLLING_MECHANISM
+
+2. Прерывания не используются. Драйвер работает по опросу.
+Опрос ставится в очередь с задержкой 1/8 времени заполнения
+FIFO.
+
+#else
+
 2. Внимание! Платы ПОВ не умеют разделять прерывания с
 другими устройствами, в том числе другими платами ПОВ.
 #ifdef COMMON_SHARED_IRQ
@@ -36,9 +46,13 @@
 и т.д.
 Для изменения номеров прерываний использовать параметры
 brd1_irq, brd2_irq, brd3_irq, brd4_irq
+
 #endif
+#endif
+
 2. Все платы работают на одной частоте 1800/3600 Гц
-3. Данные из фреймов переписываются в буфер пользователя как есть
+3. Данные из фреймов переписываются в промежуточный буфер 
+длительностью 1 с откуда и забираются клиентом.
 4. Параметры: 
 маска используемых каналов - pov_mask(по умолчанию 15, ПОВ1 и ПОВ2), 
 частота	дискретизации - sample_rate (по умолчанию 1800)
@@ -64,11 +78,20 @@ brd1_irq, brd2_irq, brd3_irq, brd4_irq
 //Флаг первого отсчета данных
 #define FIRST_SAMPLE_FLAG 1
 
-static void pov_do_work(struct work_struct *w);
-struct workqueue_struct *work_queue;
-static struct work_struct work;
-spinlock_t irq_lock = SPIN_LOCK_UNLOCKED;
+#define BUFFER_SIZE 2048    //чуть больше 1 с при 1800 Гц
+#define PROC_ENTRY "driver/pov"
 
+static DEFINE_SPINLOCK(irq_lock);
+static void pov_do_work(struct work_struct *w);
+static struct workqueue_struct *work_queue;
+
+#define USE_POLLING_MECHANISM
+#ifdef USE_POLLING_MECHANISM
+DECLARE_DELAYED_WORK(delayed_work, pov_do_work);
+static atomic_t started_refcount;   // = каналов в работе
+static long poll_delay_in_js;
+#else
+static struct work_struct work;
 #ifdef COMMON_SHARED_IRQ
 #define DEFAULT_IRQ 7	//или 12 (PS/2 мышь)
 static int irq = DEFAULT_IRQ;
@@ -84,6 +107,8 @@ module_param(brd2_irq, int, S_IRUGO);
 module_param(brd3_irq, int, S_IRUGO);
 module_param(brd4_irq, int, S_IRUGO);
 #endif
+#endif
+
 //Маска задействованных каналов
 #define POV11 0x1
 #define POV12 0x2
@@ -108,6 +133,7 @@ module_param(sample_rate, int, S_IRUGO);
 
 long long irq_counter;
 long long work_counter;
+long test_value;
 
 enum dev_states {	//Переходы:
 	STATE_UNUSED,	//=init_module=>STATE_CLOSED
@@ -148,11 +174,13 @@ struct pov_dev {
 	int data_idx;	            //Текущий индекс фрейма
     int first_sample_flag;      //Флаг начала данных
     struct sample cur_sample;
+    DECLARE_KFIFO_PTR(buffer, struct sample);
 
     struct completion compl;
 	struct cdev cdev;
 
     int bytes_in_fifo;
+    int peak_bytes_in_fifo;     //Для статистики
     //ПУ калибратор
     int pu_freq_period_ns;
     struct timespec begin_time;
@@ -170,6 +198,8 @@ struct pov_dev {
     int err_msb_byte;           //ошибок в данных фрейма
     int err_frame_close_byte;   //ошибок конца кадра
     int err_time_out;           //таймаутов на приеме 
+	int err_buffer_overflow;    //ошибок переполнения буфера
+    int buffer_fill_percentage; //заполненность буфера (%)
 };
 
 struct pov_dev channels[MAX_CHANNELS] = {
@@ -227,7 +257,12 @@ static int pov_proc_output (char *buf)
         struct pov_dev *dev = &channels[i];
         if (dev->state != STATE_UNUSED) {
             p += sprintf(p, "pov\t\t\t:%d\n", i);
+#ifdef USE_POLLING_MECHANISM
+            p += sprintf(p, "work_counter\t\t:%lld\n", work_counter);
+#else
             p += sprintf(p, "irq_counter\t\t:%lld\n", irq_counter);
+#endif
+            p += sprintf(p, "peak_bytes_in_fifo\t:%d\n", dev->peak_bytes_in_fifo);
             p += sprintf(p, "read_counter\t\t:%lld\n", dev->read_counter);
             p += sprintf(p, "bytes_read\t\t:%lld\n", dev->bytes_read);
             p += sprintf(p, "err_fifo_overflow\t:%d\n", dev->err_fifo_overflow);
@@ -237,6 +272,9 @@ static int pov_proc_output (char *buf)
             p += sprintf(p, "err_frame_close_byte\t:%d\n", 
                     dev->err_frame_close_byte);
             p += sprintf(p, "err_time_out\t\t:%d\n", dev->err_time_out);
+            p += sprintf(p, "err_buffer_overflow\t:%d\n", dev->err_buffer_overflow);
+            p += sprintf(p, "buffer_fill_percentage\t:%d\n", 
+                    (kfifo_len(&dev->buffer)*100)/BUFFER_SIZE);
             p += sprintf(p, "\n");
         }
     }
@@ -262,21 +300,26 @@ static int pov_read_proc(char *page, char **start, off_t off,
 static void dev_start(struct pov_dev *dev)
 {
     unsigned char state = inb(dev->state_port);
-    spin_lock_irq(&irq_lock);
 	//Порт фифо А четный, а В - нечетный
 	state |= (dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
-    spin_unlock_irq(&irq_lock);
+
+#ifdef USE_POLLING_MECHANISM
+    if (atomic_add_return(1, &started_refcount) == 1)
+        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
+#endif
 }
 
 static void dev_stop(struct pov_dev *dev)
 {
     unsigned char state = inb(dev->state_port);
-    spin_lock_irq(&irq_lock);
     //порт фифо А четный, а В - нечетный
 	state &= ~(dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
-    spin_unlock_irq(&irq_lock);
+
+#ifdef USE_POLLING_MECHANISM
+    atomic_sub(1, &started_refcount);
+#endif
 }
 
 static void dev_hard_error(struct pov_dev *dev, int err)
@@ -316,6 +359,7 @@ static void restart(struct pov_dev *dev)
 	dev->last_frame_num = -1;
     dev->bytes_from_pu = -1;
     dev->pu_freq_period_ns = 0;
+    dev->first_sample_flag = 1;
 } 
 
 static int dev_open( struct pov_dev *dev )
@@ -340,6 +384,8 @@ static int dev_open( struct pov_dev *dev )
     dev->err_msb_byte = 0; 
     dev->err_frame_close_byte = 0;
     dev->err_time_out = 0;
+	dev->err_buffer_overflow = 0;
+    dev->buffer_fill_percentage = 0;
 
 	dev->state = STATE_OPENED;
 	dev_start(dev);
@@ -395,93 +441,22 @@ static void calibrate_pu(int *pu_freq_period_ns, long long bytes_from_pu,
 
 static void dev_read(struct pov_dev *dev)
 {
-    if (!completion_done(&dev->compl))
-        complete(&dev->compl);
-}
- 
-static int pov_open(struct inode *inode, struct file *filp)
-{
-	struct pov_dev *dev; /* device information */
-
-	dev = container_of(inode->i_cdev, struct pov_dev, cdev);
-	filp->private_data = dev; /* for other methods */
-
-	return dev_open( dev );
-
-}
-
-static int pov_release(struct inode *inode, struct file *filp)
-{
-	struct pov_dev *dev; /* device information */
-
-	dev = container_of(inode->i_cdev, struct pov_dev, cdev);
-	filp->private_data = dev; /* for other methods */
-
-	return dev_release( dev );
-}
-
-irqreturn_t pov_irq_handler(int irq, void *dev_id)
-{
-    int i = 0;
-    struct pov_dev *dev;
-    irq_counter++;
-
-    //Сбросить прерывания
- 	for (; i < MAX_CHANNELS; i++) {
-		dev = &channels[i];
-		if (dev->state != STATE_UNUSED)
-			inb(dev->state_port);
-    } 
-
-	queue_work(work_queue, &work);
-	return IRQ_HANDLED;
-}
-
-static void pov_do_work(struct work_struct *w)
-{
-    int i = 0;
-
-    work_counter++;
-    for (; i < MAX_CHANNELS; i++) {
-		struct pov_dev *dev = &channels[i];
-		if (dev->state == STATE_OPENED)
-            dev_read(dev);
-    }
-}
-
-static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_pos )
-{
-	struct pov_dev *dev = filp->private_data;
-	int ret = 0;
-    int bytes_to_read;
     struct timespec ts;
     int fifo_counter;
     
-    if (dev->state != STATE_OPENED)
-        return -ENODEV;
-
-    size /= sizeof(struct sample);
-    if (!size)
-        return -EINVAL;
-    size *= sizeof(struct sample);
-
-    dev->read_counter++;
-
-    bytes_to_read = size;
-
     while (1) {
         unsigned char byte;
         int timestamp_adjusted = 0;
         int skipped_frames;
-        int timeout_in_jiffies; 
         int new_bytes;
-
+        unsigned long flags;
+        
         //Сохранить время и счетчик
-        spin_lock_irq(&irq_lock);
+        spin_lock_irqsave(&irq_lock, flags);
         getnstimeofday(&ts); 
         fifo_counter = inw(dev->count_port);
-        spin_unlock_irq(&irq_lock);
- 
+        spin_unlock_irqrestore(&irq_lock, flags);
+
         if (fifo_counter & AD_OVERFLOW) {
             dev->err_fifo_overflow++;
             printk(KERN_WARNING "pov%d: FIFO overflow:%x\n", 
@@ -495,6 +470,7 @@ static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_po
         fifo_counter &= COUNTER_MASK;
         new_bytes = dev_calc_data_count(dev, fifo_counter);
         dev->bytes_in_fifo += new_bytes;
+        dev->peak_bytes_in_fifo = dev->bytes_in_fifo;
 
         //Данные для калибровки ПУ
         dev->end_time = ts;
@@ -507,7 +483,7 @@ static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_po
             calibrate_pu(&dev->pu_freq_period_ns, dev->bytes_from_pu, 
                 dev->begin_time, dev->end_time);
         }
-        while (dev->bytes_in_fifo && size) {
+        while (dev->bytes_in_fifo) {
             byte = inb(dev->fifo8_port);
             dev->bytes_read++;
             dev->bytes_in_fifo--; 
@@ -603,15 +579,110 @@ retry:
                     for (i=1; i < 16; i++)
                         dev->cur_sample.data[i-1] = s.data[i];
                     dev->cur_sample.data[15] = s.data[0];
-                    copy_to_user(buf, &dev->cur_sample, sizeof(struct sample));
-                    buf += sizeof(struct sample);
-                    size -= sizeof(struct sample);
+
+                    if (kfifo_put(&dev->buffer, &dev->cur_sample) == 0) {
+                        dev->err_buffer_overflow++;
+                        dev->first_sample_flag = 1;
+                    }
                     break;
                 }
             }
         }
+        break;
+    }
+
+    if (!completion_done(&dev->compl))
+        complete(&dev->compl);
+}
+ 
+static int pov_open(struct inode *inode, struct file *filp)
+{
+	struct pov_dev *dev; /* device information */
+
+	dev = container_of(inode->i_cdev, struct pov_dev, cdev);
+	filp->private_data = dev; /* for other methods */
+
+	return dev_open( dev );
+
+}
+
+static int pov_release(struct inode *inode, struct file *filp)
+{
+	struct pov_dev *dev; /* device information */
+
+	dev = container_of(inode->i_cdev, struct pov_dev, cdev);
+	filp->private_data = dev; /* for other methods */
+
+	return dev_release( dev );
+}
+
+#ifndef USE_POLLING_MECHANISM
+irqreturn_t pov_irq_handler(int irq, void *dev_id)
+{
+    int i = 0;
+    struct pov_dev *dev;
+    irq_counter++;
+
+    //Сбросить прерывания
+ 	for (; i < MAX_CHANNELS; i++) {
+		dev = &channels[i];
+		if (dev->state != STATE_UNUSED)
+			inb(dev->state_port);
+    } 
+
+	queue_work(work_queue, &work);
+	return IRQ_HANDLED;
+}
+#endif
+
+static void pov_do_work(struct work_struct *w)
+{
+    int i = 0;
+
+#ifdef USE_POLLING_MECHANISM
+    if (atomic_read(&started_refcount))
+        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
+#endif
+
+    work_counter++;
+    for (; i < MAX_CHANNELS; i++) {
+		struct pov_dev *dev = &channels[i];
+		if (dev->state == STATE_OPENED)
+            dev_read(dev);
+    }
+
+}
+
+static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_pos )
+{
+	struct pov_dev *dev = filp->private_data;
+	int ret = 0;
+    int bytes_to_read;
+    int copied;
+    int timeout_in_jiffies;
+    
+    if (dev->state != STATE_OPENED)
+        return -ENODEV;
+
+    size /= sizeof(struct sample);
+    if (!size)
+        return -EINVAL;
+    size *= sizeof(struct sample);
+
+    dev->read_counter++;
+
+    bytes_to_read = size;
+
+    while (1) {
+        ret = kfifo_to_user(&dev->buffer, buf, size, &copied);
+        if (ret) {
+            printk(KERN_WARNING "pov%d: Copy to user failed\n", dev->index);
+            goto err_exit;
+        }
+        buf += copied;
+        size -= copied;
         if (!size) {
-            ret = bytes_to_read - size;
+            ret = bytes_to_read;
             break;
         }
         
@@ -670,7 +741,8 @@ static int __init pov_init_module(void)
 	int err = -ENODEV, i;
 	int quotient, remainder;
 	struct proc_dir_entry *ent;
-	
+
+#ifndef USE_POLLING_MECHANISM    
 #ifdef COMMON_SHARED_IRQ
     //проверка параметров
 	if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
@@ -703,6 +775,7 @@ static int __init pov_init_module(void)
             irqmask |= BIT(irqs[i/2]);
 		}
 #endif
+#endif
 
 	quotient = sample_rate/BASE_SAMPLE_RATE; 
     remainder = sample_rate%BASE_SAMPLE_RATE;
@@ -711,6 +784,12 @@ static int __init pov_init_module(void)
 		err = -EINVAL;
 		goto out_param;
 	}
+
+#ifdef USE_POLLING_MECHANISM    
+    // Период опроса - 1/4 времени заполнения ФИФО платы
+    poll_delay_in_js = HZ*FIFO_SIZE/POV_FRAME_SIZE/sample_rate/4;
+#endif
+
 	if (!pov_mask || (pov_mask & POV_MASK) != pov_mask)	{
 		printk(KERN_WARNING "pov: invalid value for parameter 'pov_mask' %d\n", pov_mask);
 		err = -EINVAL;
@@ -740,14 +819,22 @@ static int __init pov_init_module(void)
 				printk(KERN_WARNING "pov: device pov%d setup error\n", i);
 				goto out_dev;
 			}
+            err = kfifo_alloc(&channels[i].buffer, BUFFER_SIZE, GFP_KERNEL);
+            if (err) {
+				printk(KERN_WARNING "pov: error to allocate buffer\n");
+				goto out_dev;
+            }
 		}
  
     work_queue = create_singlethread_workqueue("pov_wq");
+    // +WQ_HIGHPRI
+    //work_queue = alloc_workqueue("pov_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
  	if (!work_queue) {
 		printk(KERN_WARNING "pov: create_singlethread_workqueue failed\n");
 		goto out_dev;
     }
 
+#ifndef USE_POLLING_MECHANISM
 #ifdef COMMON_SHARED_IRQ
     //Запросить прерывание в совместное пользование, 
     //в качестве уникального идентификатора - pov_major
@@ -769,8 +856,9 @@ static int __init pov_init_module(void)
         }
     }
 #endif
+#endif
 
-	ent = create_proc_read_entry("driver/pov", 0, NULL, pov_read_proc, NULL);
+	ent = create_proc_read_entry(PROC_ENTRY, 0, NULL, pov_read_proc, NULL);
 	if (!ent)
 		printk(KERN_WARNING "pov: unable to create /proc entry.\n");
 
@@ -778,8 +866,12 @@ static int __init pov_init_module(void)
     count_duration_ns = 1000000000/sample_rate;
     quantum_duration_ns = count_duration_ns/16;
     
-    INIT_WORK(&work, pov_do_work);
 
+#ifdef USE_POLLING_MECHANISM
+    printk(KERN_INFO "pov: sample_rate=%d\n", sample_rate);
+    return 0;
+#else
+    INIT_WORK(&work, pov_do_work);
 #ifdef COMMON_SHARED_IRQ
     printk(KERN_INFO "pov: init sample_rate=%d irq=%d  pov_mask=%d\n", sample_rate, irq, pov_mask);
 #else
@@ -797,13 +889,15 @@ out_irq:
         if (irqmask & BIT(i))
             free_irq(i, NULL);
 #endif
+#endif  //USE_POLLING_MECHANISM
     destroy_workqueue(work_queue);
 out_dev: 
 	class_destroy(pov_class);
  	for (i=0; i < MAX_CHANNELS; i++)
 		if (channels[i].state != STATE_UNUSED) { 
+            kfifo_free(&channels[i].buffer);    
             device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
-            cdev_del(&channels[i].cdev);    
+            cdev_del(&channels[i].cdev);
         }
 out_class:
 	unregister_chrdev_region(dev, MAX_CHANNELS);
@@ -817,9 +911,15 @@ static void __exit pov_exit_module(void)
 {
 	int i;
     printk(KERN_INFO "pov: exit\n");
+
+    remove_proc_entry(PROC_ENTRY, NULL);
+
     for (i = 0; i < MAX_CHANNELS; i++)
         dev_release(&channels[i]);
 
+#ifdef USE_POLLING_MECHANISM
+    cancel_delayed_work_sync(&delayed_work);
+#else
 #ifdef COMMON_SHARED_IRQ
 	free_irq(irq, &pov_major);
 #else
@@ -827,13 +927,15 @@ static void __exit pov_exit_module(void)
         if (irqmask & BIT(i))
            free_irq(i, NULL); 
 #endif
-
     cancel_work_sync(&work);
+#endif
+
     flush_workqueue(work_queue);
     destroy_workqueue(work_queue);
 
 	for (i = 0; i < MAX_CHANNELS; i++)
 		if (channels[i].state != STATE_UNUSED) {
+            kfifo_free(&channels[i].buffer);    
             device_destroy(pov_class, MKDEV(pov_major, pov_minor + i));
 			cdev_del(&channels[i].cdev);
         }
