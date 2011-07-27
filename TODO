@@ -1,0 +1,28 @@
+#ifndef USE_POLLING_MECHANISM
+- Повторный вызов modprobe pov дает ошибки в логе:
+[24986.585182] WARNING: at fs/proc/generic.c:589 proc_register+0xf5/0x11f()
+[24986.585199] Hardware name: VT8605
+[24986.585212] proc_dir_entry 'driver/pov' already registered
+[24986.585225] Modules linked in: pov(+) 8139too rtc_cmos i2c_viapro mii [last unloaded: pov]
+[24986.585273] Pid: 1928, comm: modprobe Tainted: G        W   2.6.36-gentoo-r5 #23
+[24986.585289] Call Trace:
+[24986.585331]  [<c101a5c9>] ? warn_slowpath_common+0x6a/0x7d
+[24986.585354]  [<c108afe0>] ? proc_register+0xf5/0x11f
+[24986.585382]  [<c101a642>] ? warn_slowpath_fmt+0x28/0x2c
+[24986.585406]  [<c108afe0>] ? proc_register+0xf5/0x11f
+[24986.585432]  [<c108b0fa>] ? create_proc_entry+0x67/0x7b
+[24986.585471]  [<c785b221>] ? pov_init_module+0x221/0x307 [pov]
+[24986.585501]  [<c785b000>] ? pov_init_module+0x0/0x307 [pov]
+[24986.585526]  [<c1001110>] ? do_one_initcall+0x67/0x107
+[24986.585557]  [<c10371b3>] ? sys_init_module+0x1100/0x12ef
+[24986.585592]  [<c11d3075>] ? syscall_call+0x7/0xb
+[24986.585611] ---[ end trace 1d760ba3406d3e8c ]---
+повторная регистрация driver/pov?
+#endif
+
+- Сделать 16-ричное чтение из FIFO
+
+- Медианный фильтр для сглаживания времени.
+
+- Разобраться со смещением времени при перестроении сигналов по 
+порядку.
