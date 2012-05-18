@@ -1,33 +1,18 @@
-SYSROOT = /usr/i586-pc-linux-gnu
-TARGET = pov
-OBJS = pov-driver.o
-# device.o
-MDIR = drivers/misc
+ifneq ($(KERNELRELEASE),)
+pov-objs 	:= pov-driver.o
+obj-m      	:= pov.o
 
-EXTRA_CFLAGS = -DEXPORT_SYMTAB
-CURRENT = $(shell uname -r)
-KDIR = $(SYSROOT)/lib/modules/$(CURRENT)/build
-PWD = $(shell pwd)
-DEST = $(SYSROOT)/lib/modules/$(CURRENT)/kernel/$(MDIR)
-
-obj-m      += pov.o
-$(TARGET)-objs = $(OBJS)
-
-default:
-	make -C $(KDIR) SUBDIRS=$(PWD) modules
-
-$(TARGET).o: $(OBJS)
-	$(LD) $(LD_RFLAG) -r -o $@ $(OBJS)
-
-ifneq (,$(findstring 2.4.,$(CURRENT)))
-install:
-	su -c "cp -v $(TARGET).o $(DEST) && /sbin/depmod -a"
 else
+KDIR        := /lib/modules/$(shell uname -r)/build
+PWD         := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
+
 install:
-	su -c "cp -v $(TARGET).ko $(DEST) && /sbin/depmod -a"
+	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules_install
 endif
 
-clean:
-	-rm -f *.o *.ko .*.cmd .*.flags *.mod.c
 
--include $(KDIR)/Rules.make
+clean:
+	-rm *.o *.ko .*.cmd *.mod.c *~
