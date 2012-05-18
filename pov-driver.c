@@ -742,13 +742,17 @@ static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_po
         ret = wait_for_completion_interruptible_timeout(&dev->compl, 
             timeout_in_jiffies);
         
-        if (ret < 0)
-            goto err_exit;
+        if (ret < 0) {
+            // Signal
+            ret = bytes_to_read - size;
+            break;
+        }
         else if (ret == 0) {
-            //ETIMEDOUT
-            if (dev->last_ret)
+            // Timeout
+            if (dev->last_ret != -ENODATA)
                 printk(KERN_WARNING "pov%d: Data read time-out\n", dev->index);
-            dev->err_time_out++;
+                dev->err_time_out++;
+            ret = -ENODATA;
             break;
         }
     }
