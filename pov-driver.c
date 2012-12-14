@@ -25,30 +25,14 @@
 Параметры драйвера задаются в файле 
 /etc/conf.d/modules
 
-#ifdef USE_POLLING_MECHANISM
-
-2. Прерывания не используются. Драйвер работает по опросу.
-Опрос ставится в очередь с задержкой 1/8 времени заполнения
-FIFO.
-
-#else
-
 2. Внимание! Платы ПОВ не умеют разделять прерывания с
 другими устройствами, в том числе другими платами ПОВ.
-#ifdef COMMON_SHARED_IRQ
-Все платы сидят на одном прерывании (один обработчик прерывания)
-возможные IRQ - 5,7,10,11,12
-Номер перывания - параметр irq (по умолчанию 7)  
-#else
 Каждая плата сидит на своем IRQ. По умолчанию: 
 ПОВ1 - IRQ5
 ПОВ2 - IRQ7
 и т.д.
 Для изменения номеров прерываний использовать параметры
 brd1_irq, brd2_irq, brd3_irq, brd4_irq
-
-#endif
-#endif
 
 2. Все платы работают на одной частоте 1800/3600 Гц
 3. Данные из фреймов переписываются в промежуточный буфер 
@@ -78,7 +62,7 @@ brd1_irq, brd2_irq, brd3_irq, brd4_irq
 //Флаг первого отсчета данных
 #define FIRST_SAMPLE_FLAG 1
 
-#define BUFFER_SIZE 2048    //чуть больше 1 с при 1800 Гц
+#define BUFFER_SIZE (2048*5)    //чуть больше 1 с при 1800 Гц
 #define PROC_ENTRY "driver/pov"
 
 static DEFINE_SPINLOCK(irq_lock);
@@ -86,18 +70,8 @@ static DEFINE_MUTEX(mutex);
 static void pov_do_work(struct work_struct *w);
 static struct workqueue_struct *work_queue;
 
-#define USE_POLLING_MECHANISM
-#ifdef USE_POLLING_MECHANISM
-DECLARE_DELAYED_WORK(delayed_work, pov_do_work);
-static atomic_t started_refcount;   // = каналов в работе
-static long poll_delay_in_js;
-#else
 static struct work_struct work;
-#ifdef COMMON_SHARED_IRQ
-#define DEFAULT_IRQ 7	//или 12 (PS/2 мышь)
-static int irq = DEFAULT_IRQ;
-module_param(irq, int, S_IRUGO);
-#else
+
 static int irqmask = 0;
 static int brd1_irq = 5;
 static int brd2_irq = 7;
@@ -107,8 +81,6 @@ module_param(brd1_irq, int, S_IRUGO);
 module_param(brd2_irq, int, S_IRUGO);
 module_param(brd3_irq, int, S_IRUGO);
 module_param(brd4_irq, int, S_IRUGO);
-#endif
-#endif
 
 //Маска задействованных каналов
 #define POV11 0x1
@@ -261,11 +233,8 @@ static int pov_proc_output (char *buf)
         struct pov_dev *dev = &channels[i];
         if (dev->state != STATE_UNUSED) {
             p += sprintf(p, "pov\t\t\t:%d\n", i);
-#ifdef USE_POLLING_MECHANISM
-            p += sprintf(p, "work_counter\t\t:%lld\n", work_counter);
-#else
             p += sprintf(p, "irq_counter\t\t:%lld\n", irq_counter);
-#endif
+            p += sprintf(p, "work_counter\t\t:%lld\n", work_counter);
             p += sprintf(p, "peak_bytes_in_fifo\t:%d\n", dev->peak_bytes_in_fifo);
             p += sprintf(p, "read_counter\t\t:%lld\n", dev->read_counter);
             p += sprintf(p, "bytes_read\t\t:%lld\n", dev->bytes_read);
@@ -308,10 +277,7 @@ static void dev_start(struct pov_dev *dev)
 	state |= (dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
 
-#ifdef USE_POLLING_MECHANISM
-    if (atomic_add_return(1, &started_refcount) == 1)
-        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
-#endif
+    //atomic_add_return(1, &started_refcount);
 }
 
 static void dev_stop(struct pov_dev *dev)
@@ -321,9 +287,7 @@ static void dev_stop(struct pov_dev *dev)
 	state &= ~(dev->fifo8_port%2+1);
 	outb(state, dev->state_port);
 
-#ifdef USE_POLLING_MECHANISM
-    atomic_sub(1, &started_refcount);
-#endif
+    //atomic_sub(1, &started_refcount);
 }
 
 static void dev_hard_error(struct pov_dev *dev, int err)
@@ -613,7 +577,6 @@ static int pov_release(struct inode *inode, struct file *filp)
 	return dev_release( dev );
 }
 
-#ifndef USE_POLLING_MECHANISM
 irqreturn_t pov_irq_handler(int irq, void *dev_id)
 {
     int i = 0;
@@ -630,7 +593,6 @@ irqreturn_t pov_irq_handler(int irq, void *dev_id)
 	queue_work(work_queue, &work);
 	return IRQ_HANDLED;
 }
-#endif
 
 static void pov_do_work(struct work_struct *w)
 {
@@ -655,6 +617,11 @@ static void pov_do_work(struct work_struct *w)
     }
     spin_unlock_irqrestore(&irq_lock, flags);
 
+    for (i=0; i < MAX_CHANNELS; i++) {
+        struct pov_dev *dev = &channels[i];
+        if (dev->state == STATE_OPENED)
+            dev_pre_read(dev, &ts);
+    }
    
     for (i=0; i < MAX_CHANNELS; i+=2) {
         struct pov_dev *devA = &channels[i];
@@ -690,12 +657,6 @@ static void pov_do_work(struct work_struct *w)
         }
     }
     mutex_unlock(&mutex);
-
-#ifdef USE_POLLING_MECHANISM
-    if (atomic_read(&started_refcount))
-        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
-#endif
-
 }
 
 static ssize_t pov_read( struct file *filp, char *buf, size_t size, loff_t *f_pos )
@@ -791,15 +752,6 @@ static int __init pov_init_module(void)
 	int quotient, remainder;
 	struct proc_dir_entry *ent;
 
-#ifndef USE_POLLING_MECHANISM    
-#ifdef COMMON_SHARED_IRQ
-    //проверка параметров
-	if (irq != 5 && irq != 7 && irq != 10 && irq != 11 && irq != 12) {
-		printk(KERN_WARNING "pov: unsupported irq number %d\n", irq);
-		err = -EINVAL;
-		goto out_param;
-	}
-#else
     //Проверить, что номера прерываний у имеющихся ПОВ различны
     int installed_irq = 0;
     int irqs[MAX_BOARDS]; 
@@ -823,8 +775,6 @@ static int __init pov_init_module(void)
             }
             irqmask |= BIT(irqs[i/2]);
 		}
-#endif
-#endif
 
 	quotient = sample_rate/BASE_SAMPLE_RATE; 
     remainder = sample_rate%BASE_SAMPLE_RATE;
@@ -833,11 +783,6 @@ static int __init pov_init_module(void)
 		err = -EINVAL;
 		goto out_param;
 	}
-
-#ifdef USE_POLLING_MECHANISM    
-    // Период опроса - 1/16 времени заполнения ФИФО платы
-    poll_delay_in_js = HZ*FIFO_SIZE/POV_FRAME_SIZE/sample_rate/16;
-#endif
 
 	if (!pov_mask || (pov_mask & POV_MASK) != pov_mask)	{
 		printk(KERN_WARNING "pov: invalid value for parameter 'pov_mask' %d\n", pov_mask);
@@ -883,16 +828,8 @@ static int __init pov_init_module(void)
 		goto out_dev;
     }
 
-#ifndef USE_POLLING_MECHANISM
-#ifdef COMMON_SHARED_IRQ
-    //Запросить прерывание в совместное пользование, 
+    //Запросить прерывание в монопольное пользование, 
     //в качестве уникального идентификатора - pov_major
-	err = request_irq(irq, pov_irq_handler, IRQF_SHARED, "pov", &pov_major);
-	if (err) {
-		printk(KERN_WARNING "pov: installing an interrupt handler for irq %d failed\n", irq);
-		goto out_queue;
-    }
-#else
     for (i = 5; i <= 12; i++) { // IRQ5 - IRQ12
         if (irqmask & BIT(i)) {
             err = request_irq(i, pov_irq_handler, IRQF_SHARED, "pov", &pov_major);
@@ -904,8 +841,6 @@ static int __init pov_init_module(void)
             installed_irq |= BIT(i);
         }
     }
-#endif
-#endif
 
 	ent = create_proc_read_entry(PROC_ENTRY, 0, NULL, pov_read_proc, NULL);
 	if (!ent)
@@ -916,30 +851,16 @@ static int __init pov_init_module(void)
     count_duration_ns = 1000000000/sample_rate;
     quantum_duration_ns = count_duration_ns/16;
     
-
-#ifdef USE_POLLING_MECHANISM
-    printk(KERN_INFO "pov: sample_rate=%d\n", sample_rate);
-    return 0;
-#else
     INIT_WORK(&work, pov_do_work);
-#ifdef COMMON_SHARED_IRQ
-    printk(KERN_INFO "pov: init sample_rate=%d irq=%d  pov_mask=%d\n", sample_rate, irq, pov_mask);
-#else
     for (i = 0; i < MAX_BOARDS; i++)
         if (irqmask | BIT(irqs[i]))
             printk(KERN_INFO "pov: board=%d init sample_rate=%d irq=%d\n", i, sample_rate, irqs[i]);
-#endif
     printk(KERN_INFO "pov: init\n");
     return 0;
-#ifdef COMMON_SHARED_IRQ
-out_queue:
-#else
 out_irq:
     for (i = 5; i <= 12; i++)   // IRQ5 - IRQ12
         if (irqmask & BIT(i))
             free_irq(i, NULL);
-#endif
-#endif  //USE_POLLING_MECHANISM
     destroy_workqueue(work_queue);
 out_dev: 
 	class_destroy(pov_class);
@@ -967,18 +888,10 @@ static void __exit pov_exit_module(void)
     for (i = 0; i < MAX_CHANNELS; i++)
         dev_release(&channels[i]);
 
-#ifdef USE_POLLING_MECHANISM
-    cancel_delayed_work_sync(&delayed_work);
-#else
-#ifdef COMMON_SHARED_IRQ
-	free_irq(irq, &pov_major);
-#else
     for (i = 5; i <= 12; i++)   // IRQ5 - IRQ12
         if (irqmask & BIT(i))
            free_irq(i, NULL); 
-#endif
     cancel_work_sync(&work);
-#endif
 
     flush_workqueue(work_queue);
     destroy_workqueue(work_queue);
