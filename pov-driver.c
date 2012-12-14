@@ -457,7 +457,7 @@ static void dev_pre_read(struct pov_dev *dev, struct timespec *ts)
 
     if (dev->cur_fifo_counter & AD_OVERFLOW) {
         dev->err_fifo_overflow++;
-        printk(KERN_WARNING "pov%d: FIFO overflow:%x\n", 
+        printk(KERN_WARNING "pov%d: FIFO overflow:%x",
                 dev->index, dev->cur_fifo_counter);
         dev_stop(dev);
         reset(dev);
@@ -638,11 +638,6 @@ static void pov_do_work(struct work_struct *w)
     unsigned long flags;
     int i;
 
-#ifdef USE_POLLING_MECHANISM
-    if (atomic_read(&started_refcount))
-        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
-#endif
-
     work_counter++;
     
     mutex_lock(&mutex);
@@ -651,24 +646,20 @@ static void pov_do_work(struct work_struct *w)
     //FIXME При инициализации драйвера сделать калибровку по времени
     //функции inw() для корректировки или
     //запрос времени перед каждым inw()
-    getnstimeofday(&ts); 
+    getnstimeofday(&ts);
     for (i=0; i < MAX_CHANNELS; i++) {
-		struct pov_dev *dev = &channels[i];
-		if (dev->state == STATE_OPENED)
+        struct pov_dev *dev = &channels[i];
+        if (dev->state == STATE_OPENED) {
             dev->cur_fifo_counter = inw(dev->count_port);
+        }
     }
     spin_unlock_irqrestore(&irq_lock, flags);
-    
-    for (i=0; i < MAX_CHANNELS; i++) {
-		struct pov_dev *dev = &channels[i];
-		if (dev->state == STATE_OPENED)
-            dev_pre_read(dev, &ts);
-    }
-    
+
+   
     for (i=0; i < MAX_CHANNELS; i+=2) {
-		struct pov_dev *devA = &channels[i];
-		struct pov_dev *devB = &channels[i+1];
-		if (devA->state == STATE_OPENED && devB->state == STATE_OPENED) {
+        struct pov_dev *devA = &channels[i];
+        struct pov_dev *devB = &channels[i+1];
+        if (devA->state == STATE_OPENED && devB->state == STATE_OPENED) {
             int shorts = min(devA->bytes_in_fifo, devB->bytes_in_fifo);
             while (shorts) {
                 u16 data = inw(devA->fifo8_port+2);
@@ -687,8 +678,8 @@ static void pov_do_work(struct work_struct *w)
     }
 
     for (i=0; i < MAX_CHANNELS; i++) {
-		struct pov_dev *dev = &channels[i];
-		if (dev->state == STATE_OPENED) {
+        struct pov_dev *dev = &channels[i];
+        if (dev->state == STATE_OPENED) {
             while (dev->bytes_in_fifo) {
                 dev->bytes_in_fifo--;
                 dev->bytes_read++;
@@ -699,6 +690,11 @@ static void pov_do_work(struct work_struct *w)
         }
     }
     mutex_unlock(&mutex);
+
+#ifdef USE_POLLING_MECHANISM
+    if (atomic_read(&started_refcount))
+        queue_delayed_work(work_queue, &delayed_work, poll_delay_in_js);
+#endif
 
 }
 
@@ -839,8 +835,8 @@ static int __init pov_init_module(void)
 	}
 
 #ifdef USE_POLLING_MECHANISM    
-    // Период опроса - 1/4 времени заполнения ФИФО платы
-    poll_delay_in_js = HZ*FIFO_SIZE/POV_FRAME_SIZE/sample_rate/4;
+    // Период опроса - 1/16 времени заполнения ФИФО платы
+    poll_delay_in_js = HZ*FIFO_SIZE/POV_FRAME_SIZE/sample_rate/16;
 #endif
 
 	if (!pov_mask || (pov_mask & POV_MASK) != pov_mask)	{
@@ -879,9 +875,9 @@ static int __init pov_init_module(void)
             }
 		}
  
-    work_queue = create_singlethread_workqueue("pov_wq");
+    //work_queue = create_singlethread_workqueue("pov_wq");
     // +WQ_HIGHPRI
-    //work_queue = alloc_workqueue("pov_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+    work_queue = alloc_workqueue("pov_wq", WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
  	if (!work_queue) {
 		printk(KERN_WARNING "pov: create_singlethread_workqueue failed\n");
 		goto out_dev;
